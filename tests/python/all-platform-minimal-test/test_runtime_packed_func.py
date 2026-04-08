@@ -14,15 +14,16 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# ruff: noqa: F401, F821
 """Test packed function FFI."""
+
 import gc
 
 import numpy as np
 
 import tvm
-from tvm import te
 import tvm.testing
-from tvm.script import tir as T
+from tvm.script import tirx as T
 
 
 def test_get_global():
@@ -132,15 +133,15 @@ def test_tensor_args():
 
 
 def test_dict_function_value_type():
-    from tvm import tir  # pylint: disable=import-outside-toplevel
+    from tvm import tirx  # pylint: disable=import-outside-toplevel
 
     te_func_dict = {"add": lambda a, b: a + b}
 
     converted_dict = tvm.runtime.convert(te_func_dict)
     f = converted_dict["add"]
-    a = tir.Var("a", "float32")
-    b = tir.Var("b", "float32")
-    tvm.ir.assert_structural_equal(f(a, b), tir.Add(a, b))
+    a = tirx.Var("a", "float32")
+    b = tirx.Var("b", "float32")
+    tvm.ir.assert_structural_equal(f(a, b), tirx.Add(a, b))
 
 
 if __name__ == "__main__":

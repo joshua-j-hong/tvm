@@ -14,15 +14,14 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# ruff: noqa: E501, E741
 import itertools
-from typing import Dict, List, Optional, Tuple, Union
 
 import pytest
 import torch
 
 import tvm
 import tvm.testing
-from tvm import dlight as dl
 from tvm.relax.frontend.nn.llm.kv_cache import (
     AttnKind,
     RopeMode,
@@ -39,6 +38,7 @@ from tvm.relax.frontend.nn.llm.kv_cache import (
     tree_attn_with_paged_kv_cache,
 )
 from tvm.runtime import ShapeTuple
+from tvm.s_tir import dlight as dl
 
 reserved_nseq = 32
 maximum_total_seq_length = 2048
@@ -90,7 +90,10 @@ def set_global_func(head_dim, dtype):
     global fpopn, fbegin_forward, fend_forward, fcommit_accepted_token_tree_nodes
     global fattention_with_fuse_qkv, fis_empty, fdebug_get_kv
     global ftranspose_append, fcopy_cache, fattn_prefill, fattn_decode
-    global fattn_prefill_ragged, fattn_prefill_with_tree_mask, fattn_prefill_with_tree_mask_paged_kv_cache
+    global \
+        fattn_prefill_ragged, \
+        fattn_prefill_with_tree_mask, \
+        fattn_prefill_with_tree_mask_paged_kv_cache
     global fattn_prefill_sliding_window, fattn_decode_sliding_window
     global fmerge_state, fsplit_rotary, fattention_rotary, fcopy_single_page, fcompact_copy
 
@@ -141,7 +144,7 @@ def set_global_func(head_dim, dtype):
         mod = tvm.IRModule({"main": tir_func})
         with target:
             mod = dl.ApplyDefaultSchedule(dl.gpu.Fallback())(mod)
-        f = tvm.tir.build(mod["main"], target=target)
+        f = tvm.tirx.build(mod["main"], target=target)
         builts.append(f.main)
 
     (
@@ -187,13 +190,13 @@ def create_kv_cache(head_dim, dtype, rope_mode, support_sliding_window):
         tvm.runtime.empty((), dtype, device=device),
         ftranspose_append,
         None,  # f_transpose_append_mla
-        ["tir", fattn_prefill_ragged],
-        ["tir", fattn_prefill],
-        ["tir", fattn_decode],
-        ["tir", fattn_prefill_sliding_window],
-        ["tir", fattn_decode_sliding_window],
-        ["tir", fattn_prefill_with_tree_mask_paged_kv_cache],
-        ["tir", fattn_prefill_with_tree_mask],
+        ["tirx", fattn_prefill_ragged],
+        ["tirx", fattn_prefill],
+        ["tirx", fattn_decode],
+        ["tirx", fattn_prefill_sliding_window],
+        ["tirx", fattn_decode_sliding_window],
+        ["tirx", fattn_prefill_with_tree_mask_paged_kv_cache],
+        ["tirx", fattn_prefill_with_tree_mask],
         [],  # f_mla_prefill
         [fmerge_state],
         fsplit_rotary,
@@ -246,7 +249,7 @@ def verify_cached_kv(kv_cache, seq_ids, expected_k, expected_v):
         )
 
 
-def f_apply_rotary(x, offset, scale, theta, offset_list: Optional[List[int]] = None):
+def f_apply_rotary(x, offset, scale, theta, offset_list: list[int] | None = None):
     # x: (N, H, D)
     assert len(x.shape) == 3
     nfeat = x.shape[-1]
@@ -276,13 +279,13 @@ def f_apply_rotary(x, offset, scale, theta, offset_list: Optional[List[int]] = N
 def apply_attention(
     kv_cache,
     rope_mode: RopeMode,
-    batch: List[Tuple[Union[int, Tuple[int, int, int]], int]],
-    cached_k: Dict[int, torch.Tensor],
-    cached_v: Dict[int, torch.Tensor],
-    sliding_window_sizes: Optional[List[int]] = None,
-    attn_sink_sizes: Optional[List[int]] = None,
-    token_tree_parent_ptr_list: Optional[List[List[int]]] = None,
-    accepted_leaf_indices: Optional[List[int]] = None,
+    batch: list[tuple[int | tuple[int, int, int], int]],
+    cached_k: dict[int, torch.Tensor],
+    cached_v: dict[int, torch.Tensor],
+    sliding_window_sizes: list[int] | None = None,
+    attn_sink_sizes: list[int] | None = None,
+    token_tree_parent_ptr_list: list[list[int]] | None = None,
+    accepted_leaf_indices: list[int] | None = None,
 ) -> None:
     seq_ids = []
     append_lengths = []
@@ -314,7 +317,7 @@ def apply_attention(
             )
 
     flattened_token_tree_parent_ptr = None
-    token_tree_node_depths_list: List[Optional[List[int]]] = [None for _ in batch]
+    token_tree_node_depths_list: list[list[int] | None] = [None for _ in batch]
     if token_tree_parent_ptr_list:
         assert len(token_tree_node_depths_list) == len(seq_ids)
         if accepted_leaf_indices is not None:

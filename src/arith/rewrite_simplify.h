@@ -26,7 +26,7 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/op.h>
+#include <tvm/tirx/op.h>
 
 #include <algorithm>
 #include <unordered_map>
@@ -39,7 +39,7 @@
 namespace tvm {
 namespace arith {
 
-using namespace tir;
+using namespace tirx;
 
 /* \brief Usage counters for RewriteSimplifier
  *
@@ -142,7 +142,8 @@ class RewriteSimplifier::Impl : public IRMutatorWithAnalyzer {
   void RecordRewrite() {
     stats_.rewrites_performed++;
 
-    ICHECK(maximum_rewrite_steps_ <= 0 || stats_.rewrites_performed <= maximum_rewrite_steps_)
+    TVM_FFI_ICHECK(maximum_rewrite_steps_ <= 0 ||
+                   stats_.rewrites_performed <= maximum_rewrite_steps_)
         << "RewriteSimplifier exceeded maximum number of rewrites allowed ("
         << maximum_rewrite_steps_ << ")";
   }

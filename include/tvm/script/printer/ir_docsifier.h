@@ -22,7 +22,7 @@
 #include <tvm/ffi/reflection/access_path.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/module.h>
-#include <tvm/node/node.h>
+#include <tvm/node/cast.h>
 #include <tvm/script/printer/doc.h>
 #include <tvm/script/printer/ir_docsifier_functor.h>
 
@@ -344,7 +344,7 @@ inline TDoc IRDocsifierNode::AsDoc(const Any& value, const AccessPath& path) con
         AddDocDecoration<TDoc>(d, obj, path, cfg);
         return Downcast<TDoc>(d);
       } else {
-        LOG(FATAL) << "TypeError: Cannot handle Any type: `" << value.GetTypeKey() << "`";
+        TVM_FFI_THROW(TypeError) << "Cannot handle Any type: `" << value.GetTypeKey() << "`";
         TVM_FFI_UNREACHABLE();
       }
     }

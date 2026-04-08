@@ -14,27 +14,30 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-import pytest
-from typing import Callable, Union, Tuple, List
+# ruff: noqa: F401, F811, RUF005
+from collections.abc import Callable
+from typing import Union
 
 import numpy as np
+import pytest
+
 import tvm
-from tvm.relax.expr import Call
-from tvm.relax.struct_info import TensorStructInfo, TupleStructInfo
 import tvm.testing
 from tvm import relax
+from tvm.ir.op import Op
+from tvm.relax.expr import Call
+from tvm.relax.struct_info import TensorStructInfo, TupleStructInfo
 from tvm.relax.transform import LegalizeOps
 from tvm.testing.utils import check_numerical_grads
-from tvm.ir.op import Op
 
 
 def relax_check_gradients(
     op_func: Callable,
-    inputs_numpy: List[np.array],
-    target: Union[str, tvm.target.Target],
+    inputs_numpy: list[np.array],
+    target: str | tvm.target.Target,
     dev: tvm.runtime.Device,
     tuple_input: bool = False,
-    ignore_grads: List[int] = [],
+    ignore_grads: list[int] = [],
     **kwargs,  # attr for operators
 ):
     """Generate the forward and the gradient module. Then run them and check numeric gradients.

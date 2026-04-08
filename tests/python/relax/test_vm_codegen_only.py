@@ -14,12 +14,15 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# ruff: noqa: F841
 """Test last-stage of codegen VM.
 
 Restrictions: all shape lowered, explicit allocation.
 """
+
 import numpy as np
 import pytest
+
 import tvm
 import tvm.testing
 from tvm import relax
@@ -27,7 +30,7 @@ from tvm.relax.testing.runtime_builtin import MakeShapeCode, MatchShapeCode
 from tvm.relax.testing.vm import check_saved_func
 from tvm.script import ir as I
 from tvm.script import relax as R
-from tvm.script import tir as T
+from tvm.script import tirx as T
 
 EXEC_MODE = ["bytecode", "compiled"]
 
@@ -364,9 +367,9 @@ def test_vm_kill_object(exec_mode):
     class TestKillObject:
         @T.prim_func
         def full(T_full: T.Buffer((T.int64(4),), "float32")):
-            T.func_attr({"global_symbol": "full", "tir.noalias": True})
+            T.func_attr({"global_symbol": "full", "tirx.noalias": True})
             for ax0 in range(T.int64(4)):
-                with T.block("T_full"):
+                with T.sblock("T_full"):
                     v_ax0 = T.axis.spatial(T.int64(4), ax0)
                     T.reads()
                     T.writes(T_full[v_ax0])
@@ -374,9 +377,9 @@ def test_vm_kill_object(exec_mode):
 
         @T.prim_func
         def full1(T_full: T.Buffer((T.int64(4),), "float32")):
-            T.func_attr({"global_symbol": "full1", "tir.noalias": True})
+            T.func_attr({"global_symbol": "full1", "tirx.noalias": True})
             for ax0 in range(T.int64(4)):
-                with T.block("T_full"):
+                with T.sblock("T_full"):
                     v_ax0 = T.axis.spatial(T.int64(4), ax0)
                     T.reads()
                     T.writes(T_full[v_ax0])

@@ -14,11 +14,12 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# ruff: noqa: F841
 import tvm
 import tvm.testing
 from tvm import relax as rx
 from tvm.script import relax as R
-from tvm.script import tir as T
+from tvm.script import tirx as T
 
 
 @tvm.register_global_func("test.op.identity", override=True)
@@ -32,7 +33,7 @@ def identity_tir(a: T.handle, b: T.handle) -> None:
     B = T.match_buffer(b, [54, 96])
 
     for i, j in T.grid(54, 96):
-        with T.block("compute"):
+        with T.sblock("compute"):
             vi, vj = T.axis.remap("SS", [i, j])
             B[vi, vj] = A[vi, vj]
 
@@ -58,12 +59,12 @@ def test_call_tir_with_grad():
     )
     assert v2.attrs.te_grad_name == "identity_k_grad"
     assert isinstance(v2.attrs.te_grad_kwargs, tvm.ir.container.Map)
-    val = list(v2.attrs.te_grad_kwargs.items())[0]
+    val = next(iter(v2.attrs.te_grad_kwargs.items()))
     assert val[0] == "k" and float(val[1]) == 1.0
 
 
 def test_implicit_op():
-    m, n = tvm.tir.Var("m", "int64"), tvm.tir.Var("n", "int64")
+    m, n = tvm.tirx.Var("m", "int64"), tvm.tirx.Var("n", "int64")
     x = rx.Var("x", R.Tensor([m, n], "float32"))
     y = rx.Var("y", R.Tensor([m, n], "float32"))
     func = rx.Var(

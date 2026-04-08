@@ -125,9 +125,8 @@ class FunctionFrameNode : public SeqExprFrameNode {
         .def_ro("params", &FunctionFrameNode::params)
         .def_ro("ret_struct_info", &FunctionFrameNode::ret_struct_info)
         .def_ro("is_pure", &FunctionFrameNode::is_pure)
-        .def_ro("attrs", &FunctionFrameNode::attrs)
-        .def_ro("binding_blocks", &FunctionFrameNode::binding_blocks)
-        .def_ro("output", &FunctionFrameNode::output);
+        .def_ro("attrs", &FunctionFrameNode::attrs);
+    // `binding_blocks` and `output` are inherited from SeqExprFrameNode.
     // `block_builder` is not registered as it's not visited.
   }
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("script.ir_builder.relax.FunctionFrame", FunctionFrameNode,
@@ -147,7 +146,7 @@ class FunctionFrame : public SeqExprFrame {
 };
 
 /*! \brief The ir_builder frame for relax binding blocks. */
-class BlockFrameNode : public RelaxFrameNode {
+class BindingBlockFrameNode : public RelaxFrameNode {
  public:
   /*! \brief The flag that indicates whether the block is a dataflow block. */
   bool is_dataflow;
@@ -167,26 +166,27 @@ class BlockFrameNode : public RelaxFrameNode {
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
-    refl::ObjectDef<BlockFrameNode>()
-        .def_ro("is_dataflow", &BlockFrameNode::is_dataflow)
-        .def_ro("emitted_vars", &BlockFrameNode::emitted_vars)
-        .def_ro("output_vars", &BlockFrameNode::output_vars);
+    refl::ObjectDef<BindingBlockFrameNode>()
+        .def_ro("is_dataflow", &BindingBlockFrameNode::is_dataflow)
+        .def_ro("emitted_vars", &BindingBlockFrameNode::emitted_vars)
+        .def_ro("output_vars", &BindingBlockFrameNode::output_vars);
     // `block_ended` is not registered as it's not visited.
   }
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("script.ir_builder.relax.BlockFrame", BlockFrameNode,
-                                    RelaxFrameNode);
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("script.ir_builder.relax.BindingBlockFrame",
+                                    BindingBlockFrameNode, RelaxFrameNode);
 
  public:
   void EnterWithScope() final;
   void ExitWithScope() final;
 };
 
-class BlockFrame : public RelaxFrame {
+class BindingBlockFrame : public RelaxFrame {
  public:
-  explicit BlockFrame(ObjectPtr<BlockFrameNode> data) : RelaxFrame(data) {
+  explicit BindingBlockFrame(ObjectPtr<BindingBlockFrameNode> data) : RelaxFrame(data) {
     TVM_FFI_ICHECK(data != nullptr);
   }
-  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(BlockFrame, RelaxFrame, BlockFrameNode);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(BindingBlockFrame, RelaxFrame,
+                                                BindingBlockFrameNode);
 };
 
 /*!

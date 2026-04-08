@@ -38,7 +38,7 @@
 #include <tvm/relax/expr.h>
 #include <tvm/relax/nested_msg.h>
 #include <tvm/relax/op_attr_types.h>
-#include <tvm/tir/data_layout.h>
+#include <tvm/s_tir/data_layout.h>
 
 #include <array>
 #include <string>
@@ -49,7 +49,7 @@
 namespace tvm {
 namespace relax {
 
-using tir::Layout;
+using tirx::Layout;
 
 /*!
  * \brief A layout decision node that holds the layout decision of the tensor.

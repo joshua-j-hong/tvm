@@ -42,7 +42,7 @@ class RelaxFrameNode : public FrameNode {
  public:
   bool is_func = false;
   bool module_alias_printed = false;
-  std::unordered_set<const tir::VarNode*>* func_vars = nullptr;
+  std::unordered_set<const tirx::VarNode*>* func_vars = nullptr;
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
@@ -125,7 +125,7 @@ inline ffi::Optional<ExprDoc> StructInfoAsAnn(const relax::Var& v, const AccessP
       inferred_sinfo = trivial_binding->struct_info_.as<relax::StructInfo>();
     }
 
-    if (inferred_sinfo && StructuralEqual()(inferred_sinfo, v->struct_info_)) {
+    if (inferred_sinfo && ffi::StructuralEqual()(inferred_sinfo, v->struct_info_)) {
       return std::nullopt;
     }
   }

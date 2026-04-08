@@ -15,17 +15,17 @@
 # specific language governing permissions and limitations
 # under the License.
 # pylint: disable=missing-docstring,
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 import numpy as np
 import pytest
 
 import tvm
 import tvm.testing
-from tvm import dlight as dl
-from tvm import tir
+from tvm import tirx
 from tvm.runtime import ShapeTuple
-from tvm.script import tir as T
+from tvm.s_tir import dlight as dl
+from tvm.script import tirx as T
 
 # pylint: disable=invalid-name
 
@@ -80,7 +80,7 @@ def set_global_func():
         mod = tvm.IRModule({"main": tir_func})
         with target:
             mod = dl.ApplyDefaultSchedule(dl.gpu.Fallback())(mod)  # pylint: disable=not-callable
-        f = tvm.tir.build(mod["main"], target=target)
+        f = tvm.tirx.build(mod["main"], target=target)
         return f.main
 
     _f_tir_gets, _f_tir_sets = [], []
@@ -203,7 +203,7 @@ def rnn_state_get(
 
         for i in range(batch_size):
             for s in T.grid(*shape):
-                with T.block("copy"):
+                with T.sblock("copy"):
                     vi, *vs = T.axis.remap("S" * (len(shape) + 1), [i, *s])
                     seq_id: T.int32 = seq_slot_ids[vi]
                     history_id: T.int32 = history_slot_ids[vi]
@@ -218,7 +218,7 @@ def rnn_state_get(
 
 
 def rnn_state_set(
-    shape: Sequence[Union[int, tir.Var]],
+    shape: Sequence[int | tirx.Var],
     dtype: str,
 ):
     # fmt: off
@@ -238,7 +238,7 @@ def rnn_state_set(
 
         for i in range(batch_size):
             for s in T.grid(*shape):
-                with T.block("copy"):
+                with T.sblock("copy"):
                     vi, *vs = T.axis.remap("S" * (len(shape) + 1), [i, *s])
                     seq_id: T.int32 = seq_slot_ids[vi]
                     history_id: T.int32 = (history_slot_ids[vi] + 1) % T.cast(

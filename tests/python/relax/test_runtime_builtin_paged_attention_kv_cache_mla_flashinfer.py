@@ -15,7 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 import itertools
-from typing import Dict, List, Tuple, Union
 
 import numpy as np
 import pytest
@@ -23,7 +22,6 @@ import torch
 
 import tvm
 import tvm.testing
-from tvm import dlight as dl
 from tvm import relax
 from tvm.relax.frontend.nn.llm.kv_cache import (
     AttnKind,
@@ -34,6 +32,7 @@ from tvm.relax.frontend.nn.llm.kv_cache import (
     _merge_state_inplace,
 )
 from tvm.runtime import ShapeTuple
+from tvm.s_tir import dlight as dl
 
 np.random.seed(0)
 
@@ -147,7 +146,7 @@ def set_global_func(dtype):
         mod = tvm.IRModule({"main": tir_func})
         with target:
             mod = dl.ApplyDefaultSchedule(dl.gpu.Fallback())(mod)
-        f = tvm.tir.build(mod["main"], target=target)
+        f = tvm.tirx.build(mod["main"], target=target)
         builts.append(f.main)
 
     (
@@ -245,8 +244,8 @@ def verify_cached_kv(kv_cache, seq_ids, expected_kv):
 
 def apply_attention(
     kv_cache,
-    batch: List[Tuple[Union[int, Tuple[int, int, int]], int]],
-    cached_kv: Dict[int, torch.Tensor],
+    batch: list[tuple[int | tuple[int, int, int], int]],
+    cached_kv: dict[int, torch.Tensor],
 ) -> None:
     seq_ids = []
     append_lengths = []

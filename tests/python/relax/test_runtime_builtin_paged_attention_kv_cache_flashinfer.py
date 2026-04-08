@@ -14,14 +14,13 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-from typing import Dict, List, Tuple, Union
+# ruff: noqa: E741
 
 import pytest
 import torch
 
 import tvm
 import tvm.testing
-from tvm import dlight as dl
 from tvm import relax
 from tvm.relax.frontend.nn.llm.kv_cache import (
     AttnKind,
@@ -34,6 +33,7 @@ from tvm.relax.frontend.nn.llm.kv_cache import (
     llama_rope_with_position_map,
 )
 from tvm.runtime import ShapeTuple
+from tvm.s_tir import dlight as dl
 
 reserved_nseq = 32
 maximum_total_seq_length = 2048
@@ -136,7 +136,7 @@ def set_global_func(rope_mode: RopeMode):
         mod = tvm.IRModule({"main": tir_func})
         with target:
             mod = dl.ApplyDefaultSchedule(dl.gpu.Fallback())(mod)
-        f = tvm.tir.build(mod["main"], target=target)
+        f = tvm.tirx.build(mod["main"], target=target)
         builts.append(f.main)
 
     (
@@ -242,9 +242,9 @@ def f_apply_rotary(x, offset, scale, theta):
 def apply_attention(
     kv_cache,
     rope_mode: RopeMode,
-    batch: List[Tuple[Union[int, Tuple[int, int, int]], int]],
-    cached_k: Dict[int, torch.Tensor],
-    cached_v: Dict[int, torch.Tensor],
+    batch: list[tuple[int | tuple[int, int, int], int]],
+    cached_k: dict[int, torch.Tensor],
+    cached_v: dict[int, torch.Tensor],
 ) -> None:
     seq_ids = []
     append_lengths = []

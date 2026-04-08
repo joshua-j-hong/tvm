@@ -36,7 +36,7 @@ using NDIntSet = std::vector<arith::IntSet>;
  * \param region The region.
  * \return The constructed set.
  */
-inline NDIntSet NDIntSetFromRegion(const tir::Region& region) {
+inline NDIntSet NDIntSetFromRegion(const tirx::Region& region) {
   NDIntSet result;
   result.reserve(region.size());
   for (const Range& range : region) {
@@ -81,7 +81,7 @@ inline NDIntSet NDIntSetFromPoint(const ffi::Array<PrimExpr>& indices) {
  * \param rhs The second N-dimensional integer set
  */
 inline void NDIntSetUnionWith(NDIntSet* lhs, const NDIntSet& rhs) {
-  ICHECK_EQ(lhs->size(), rhs.size());
+  TVM_FFI_ICHECK_EQ(lhs->size(), rhs.size());
   int ndim = rhs.size();
   for (int i = 0; i < ndim; ++i) {
     arith::IntSet& int_set = lhs->at(i);
@@ -95,14 +95,14 @@ inline void NDIntSetUnionWith(NDIntSet* lhs, const NDIntSet& rhs) {
  * \return The result of the union
  */
 inline NDIntSet NDIntSetUnion(const std::vector<NDIntSet>& nd_int_sets) {
-  ICHECK(!nd_int_sets.empty());
+  TVM_FFI_ICHECK(!nd_int_sets.empty());
   int n = nd_int_sets.size();
   if (n == 1) {
     return nd_int_sets[0];
   }
   int ndim = nd_int_sets[0].size();
   for (int i = 1; i < n; ++i) {
-    ICHECK_EQ(nd_int_sets[i].size(), ndim);
+    TVM_FFI_ICHECK_EQ(nd_int_sets[i].size(), ndim);
   }
   NDIntSet result;
   result.reserve(ndim);
@@ -135,7 +135,7 @@ inline NDIntSet NDIntSetEmpty(int ndim) {
  */
 inline NDIntSet NDIntSetEval(
     const NDIntSet& nd_int_set,
-    const std::unordered_map<const tir::VarNode*, arith::IntSet>& dom_map) {
+    const std::unordered_map<const tirx::VarNode*, arith::IntSet>& dom_map) {
   NDIntSet ret;
   ret.reserve(nd_int_set.size());
   for (const arith::IntSet& s : nd_int_set) {

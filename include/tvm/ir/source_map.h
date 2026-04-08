@@ -23,9 +23,9 @@
 #ifndef TVM_IR_SOURCE_MAP_H_
 #define TVM_IR_SOURCE_MAP_H_
 
+#include <tvm/ffi/container/array.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/node/node.h>
 #include <tvm/runtime/object.h>
 
 #include <fstream>
@@ -214,7 +214,7 @@ class SourceMap : public ObjectRef {
   void Add(const Source& source);
 
   SourceMapObj* operator->() {
-    ICHECK(get() != nullptr);
+    TVM_FFI_ICHECK(get() != nullptr);
     return static_cast<SourceMapObj*>(get_mutable());
   }
 

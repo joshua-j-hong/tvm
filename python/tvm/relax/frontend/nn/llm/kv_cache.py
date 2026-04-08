@@ -14,20 +14,21 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# ruff: noqa: E501, E731, RUF005, RUF012
 
 """Attention KV cache modeling."""
 
 # pylint: disable=too-many-statements,too-many-lines,too-many-arguments,invalid-name
 import enum
 import math
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Literal
 
 import tvm
 from tvm import relax as rx
-from tvm import tir
+from tvm import s_tir, tirx
 from tvm.relax.frontend.nn import Object, Tensor
 from tvm.runtime import DataType
-from tvm.script import tir as T
+from tvm.script import tirx as T
 from tvm.target import Target
 
 from .position_embedding import llama_rope_with_position_map, switch_rope_freq_func
@@ -40,7 +41,7 @@ from .tree_attn import (
 
 
 def _var_cpu(dtype):
-    return T.alloc_buffer((1,), dtype)
+    return T.sblock_alloc_buffer((1,), dtype)
 
 
 def get_max_num_threads_per_block(target: Target) -> int:
@@ -48,7 +49,7 @@ def get_max_num_threads_per_block(target: Target) -> int:
     max(max_num_threads, max_threads_per_block); if latter does not exist, return max_num_threads.
     We add this method since some targets have both fields and `max_threads_per_block` is larger.
     """
-    max_num_threads = target.max_num_threads
+    max_num_threads = int(target.attrs["max_num_threads"])
     max_threads_per_block = target.attrs.get("max_threads_per_block", None)
     if max_threads_per_block is None:
         return max_num_threads
@@ -68,11 +69,11 @@ def check_thread_limits(target: Target, bdx: int, bdy: int, bdz: int, gdz: int):
     """
     max_num_threads_per_block = get_max_num_threads_per_block(target)
 
-    assert (
-        bdx * bdy * bdz <= max_num_threads_per_block
-    ), f"{target.kind} max num threads exceeded: {bdx}*{bdy}*{bdz}>{max_num_threads_per_block}"
+    assert bdx * bdy * bdz <= max_num_threads_per_block, (
+        f"{target.kind} max num threads exceeded: {bdx}*{bdy}*{bdz}>{max_num_threads_per_block}"
+    )
 
-    if str(target.kind) == "webgpu":
+    if target.kind.name == "webgpu":
         # https://gpuweb.github.io/gpuweb/#dom-supported-limits-maxcomputeworkgroupsizez
         assert bdz <= 64, f"webgpu's threadIdx.z cannot exceed 64, but got bdz={bdz}"
         assert gdz == 1, f"webgpu's blockIdx.z should be 1, but got gdz={gdz}"
@@ -104,7 +105,7 @@ class RopeMode(enum.IntEnum):
 class PagedKVCache(Object):  # pylint: disable=too-few-public-methods
     """The Paged KV Cache used in LLM batching for efficient attention computation."""
 
-    extern_mods: List[tvm.runtime.Module] = []
+    extern_mods: list[tvm.runtime.Module] = []
 
     def attention_with_fused_qkv(
         self,
@@ -150,7 +151,7 @@ class PagedKVCache(Object):  # pylint: disable=too-few-public-methods
         k: Tensor,
         v: Tensor,
         sm_scale: float,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         """Fine-grained API that computes ragged self attention with Q/K/V data."""
         # pylint: disable=protected-access
         b, s, h_qo, d_qk = q._expr.struct_info.shape
@@ -188,7 +189,7 @@ class PagedKVCache(Object):  # pylint: disable=too-few-public-methods
         q: Tensor,
         v_head_dim: int,
         sm_scale: float,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         """Fine-grained API that computes paged cross attention with Q and in-cache KV data."""
         # pylint: disable=protected-access
         b, s, h_qo, d_qk = q._expr.struct_info.shape
@@ -237,7 +238,7 @@ class PagedKVCache(Object):  # pylint: disable=too-few-public-methods
         lse_self_attn: Tensor,
         o_cross_attn: Tensor,
         lse_cross_attn: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         """Fine-grained API that merges the attention output from two sources.
         The first two tensors will be inplace updated.
         """
@@ -269,13 +270,13 @@ class PagedKVCache(Object):  # pylint: disable=too-few-public-methods
         lse_self_attn = Tensor(_expr=bb.emit(rx.TupleGetItem(merge_results, 1))).reshape(b, s, h_qo)
         return o_self_attn, lse_self_attn
 
-    def get_query_positions(self, total_length: tir.PrimExpr) -> Tensor:
+    def get_query_positions(self, total_length: tirx.PrimExpr) -> Tensor:
         """Get the in-sequence positions of each slot in the query,
         which are needed for applying positional embeddings in some models.
 
         Parameters
         ----------
-        total_length : tir.PrimExpr
+        total_length : tirx.PrimExpr
             The summed-up total sequence length of queries in
             the batch being forwarded.
 
@@ -297,17 +298,34 @@ class PagedKVCache(Object):  # pylint: disable=too-few-public-methods
     # pylint: enable=protected-access
 
 
+def _prepare_yarn_rope_scaling(
+    rope_scaling: dict[str, Any] | None,
+    rope_theta: float | None,
+) -> dict[str, Any] | None:
+    """Ensure Yarn-specific scaling configs include the theta metadata."""
+    if rope_scaling is None:
+        return None
+    if rope_scaling.get("rope_type") != "yarn":
+        return rope_scaling
+
+    rope_scaling_updated = dict(rope_scaling)
+    if "inv_theta_log_scale" not in rope_scaling_updated and rope_theta is not None:
+        theta_value = float(rope_theta)
+        rope_scaling_updated["inv_theta_log_scale"] = 1.0 / (2 * math.log(theta_value))
+    return rope_scaling_updated
+
+
 class FlashInferPagedKVCache(PagedKVCache):  # pylint: disable=too-few-public-methods
     """Paged KV cache using FlashInfer (CUDA) kernels."""
 
     def __init__(  # pylint: disable=too-many-locals
         self,
-        attn_kind: Union[Literal["mha", "mla"], List[Literal["mha", "mla", "mha_sliding"]]],
-        max_batch_size: tir.Var,
-        max_total_seq_len: tir.Var,
-        prefill_chunk_size: tir.Var,
-        page_size: tir.Var,
-        support_sliding_window: tir.Var,
+        attn_kind: Literal["mha", "mla"] | list[Literal["mha", "mla", "mha_sliding"]],
+        max_batch_size: tirx.Var,
+        max_total_seq_len: tirx.Var,
+        prefill_chunk_size: tirx.Var,
+        page_size: tirx.Var,
+        support_sliding_window: tirx.Var,
         layer_partition: rx.ShapeExpr,
         num_hidden_layers: int,
         num_attention_heads: int,
@@ -319,7 +337,7 @@ class FlashInferPagedKVCache(PagedKVCache):  # pylint: disable=too-few-public-me
         rope_mode: RopeMode,
         rope_scale: int,
         rope_theta: int,
-        rope_scaling: Dict[str, Any],
+        rope_scaling: dict[str, Any],
         rope_ext_factors: rx.Expr,
         rotary_dim: int,
         enable_disaggregation: bool,
@@ -331,23 +349,23 @@ class FlashInferPagedKVCache(PagedKVCache):  # pylint: disable=too-few-public-me
 
         Parameters
         ----------
-        max_batch_size : tir.Var
+        max_batch_size : tirx.Var
             The maximum allowed batch size of the KV cache.
             It is a symbolic variable whose concrete value is specified
             at runtime.
-        max_total_seq_len : tir.Var
+        max_total_seq_len : tirx.Var
             The maximum allowed total sequence length of the KV cache.
             It is a symbolic variable whose concrete value is specified
             at runtime.
-        prefill_chunk_size : tir.Var
+        prefill_chunk_size : tirx.Var
             The maximum total sequence length in a prefill.
             It is a symbolic variable whose concrete value is specified
             at runtime.
-        page_size : tir.Var
+        page_size : tirx.Var
             The size (a.k.a. number of tokens) of each page.
             It is a symbolic variable whose concrete value is specified
             at runtime.
-        support_sliding_window : tir.Var
+        support_sliding_window : tirx.Var
             0 or 1, denoting whether the KV cache supports sliding window.
             It is a symbolic variable whose concrete value is specified
             at runtime.
@@ -372,8 +390,9 @@ class FlashInferPagedKVCache(PagedKVCache):  # pylint: disable=too-few-public-me
             Whether to enable disaggregation in the KV cache.
         """
         assert rope_mode != RopeMode.INLINE, "FlashInfer RoPE does not support inline mode."
+        rope_scaling = _prepare_yarn_rope_scaling(rope_scaling, rope_theta)
 
-        attn_kind_single = attn_kind[0] if isinstance(attn_kind, List) else attn_kind
+        attn_kind_single = attn_kind[0] if isinstance(attn_kind, list) else attn_kind
         if attn_kind_single == "mha_sliding":
             attn_kind_single = "mha"
         flashinfer_prefill_mods = rx.backend.cuda.flashinfer.gen_flashinfer_prefill_module(
@@ -419,10 +438,10 @@ class FlashInferPagedKVCache(PagedKVCache):  # pylint: disable=too-few-public-me
             [
                 rx.Tuple([rx.StringImm("flashinfer"), rx.ExternFunc("batch_prefill_paged_run"), rx.ExternFunc("batch_prefill_plan")]),
                 rx.Tuple([rx.StringImm("flashinfer"), rx.ExternFunc("batch_decode_run"), rx.ExternFunc("batch_decode_plan")]),
-                rx.Tuple([rx.StringImm("tir"), bb.add_func(_attention_prefill(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, True, rope_scaling, target), "tir_attention_prefill_sliding_window")]),
-                rx.Tuple([rx.StringImm("tir"), bb.add_func(_attention_decode(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, True, rope_scaling, target), "tir_attention_decode_sliding_window")]),
-                rx.Tuple([rx.StringImm("tir"), bb.add_func(tree_attn_with_paged_kv_cache(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, rope_scaling, target), "tir_attention_prefill_with_tree_mask_with_paged_kv_cache")]),
-                rx.Tuple([rx.StringImm("tir"), bb.add_func(tree_attn(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, rope_scaling, target), "tir_attention_prefill_with_tree_mask")]),
+                rx.Tuple([rx.StringImm("tirx"), bb.add_func(_attention_prefill(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, True, rope_scaling, target), "tir_attention_prefill_sliding_window")]),
+                rx.Tuple([rx.StringImm("tirx"), bb.add_func(_attention_decode(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, True, rope_scaling, target), "tir_attention_decode_sliding_window")]),
+                rx.Tuple([rx.StringImm("tirx"), bb.add_func(tree_attn_with_paged_kv_cache(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, rope_scaling, target), "tir_attention_prefill_with_tree_mask_with_paged_kv_cache")]),
+                rx.Tuple([rx.StringImm("tirx"), bb.add_func(tree_attn(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, rope_scaling, target), "tir_attention_prefill_with_tree_mask")]),
             ]
             if attn_kind_single == "mha"
             else [rx.Tuple([]) for _ in range(6)]
@@ -435,7 +454,7 @@ class FlashInferPagedKVCache(PagedKVCache):  # pylint: disable=too-few-public-me
         if attn_kind_single == "mla":
             attn_merge_functions.append(bb.add_func(_merge_state_inplace(num_attention_heads, mla_original_v_head_dim, dtype, target, "tir_attention_merge_state_mla"), "tir_attention_merge_state_mla"))
 
-        if isinstance(attn_kind, List):
+        if isinstance(attn_kind, list):
             attn_kind = [int(getattr(AttnKind, layer_kind.upper())) for layer_kind in attn_kind]
         else:
             attn_kind = [int(getattr(AttnKind, attn_kind.upper())) for _ in range(num_hidden_layers)]
@@ -472,7 +491,6 @@ class FlashInferPagedKVCache(PagedKVCache):  # pylint: disable=too-few-public-me
             bb.add_func(_copy_single_page(num_key_value_heads, page_size, qk_head_dim, dtype, target) if attn_kind_single == "mha" else _copy_single_page_mla(page_size, qk_head_dim, dtype, target), "kv_cache_copy_single_page"),
             bb.add_func(_kv_cache_debug_get_kv(num_hidden_layers, num_key_value_heads, qk_head_dim, dtype), "kv_cache_debug_get_kv"),
             bb.add_func(_compact_kv_copy(num_key_value_heads, qk_head_dim, dtype, target), "kv_cache_compact_kv_copy"),
-            # fmt: on
             # pylint: enable=line-too-long
         ]
         super().__init__(
@@ -490,12 +508,12 @@ class TIRPagedKVCache(PagedKVCache):  # pylint: disable=too-few-public-methods
 
     def __init__(  # pylint: disable=too-many-locals
         self,
-        attn_kind: Union[Literal["mha", "mla"], List[Literal["mha", "mla", "mha_sliding"]]],
-        max_batch_size: tir.Var,
-        max_total_seq_len: tir.Var,
-        prefill_chunk_size: tir.Var,
-        page_size: tir.Var,
-        support_sliding_window: tir.Var,
+        attn_kind: Literal["mha", "mla"] | list[Literal["mha", "mla", "mha_sliding"]],
+        max_batch_size: tirx.Var,
+        max_total_seq_len: tirx.Var,
+        prefill_chunk_size: tirx.Var,
+        page_size: tirx.Var,
+        support_sliding_window: tirx.Var,
         layer_partition: rx.ShapeExpr,
         num_hidden_layers: int,
         num_attention_heads: int,
@@ -507,7 +525,7 @@ class TIRPagedKVCache(PagedKVCache):  # pylint: disable=too-few-public-methods
         rope_mode: RopeMode,
         rope_scale: int,
         rope_theta: int,
-        rope_scaling: Dict[str, Any],
+        rope_scaling: dict[str, Any],
         rope_ext_factors: rx.Expr,
         rotary_dim: int,
         enable_disaggregation: bool,
@@ -519,23 +537,23 @@ class TIRPagedKVCache(PagedKVCache):  # pylint: disable=too-few-public-methods
 
         Parameters
         ----------
-        max_batch_size : tir.Var
+        max_batch_size : tirx.Var
             The maximum allowed batch size of the KV cache.
             It is a symbolic variable whose concrete value is specified
             at runtime.
-        max_total_seq_len : tir.Var
+        max_total_seq_len : tirx.Var
             The maximum allowed total sequence length of the KV cache.
             It is a symbolic variable whose concrete value is specified
             at runtime.
-        prefill_chunk_size : tir.Var
+        prefill_chunk_size : tirx.Var
             The maximum total sequence length in a prefill.
             It is a symbolic variable whose concrete value is specified
             at runtime.
-        page_size : tir.Var
+        page_size : tirx.Var
             The size (a.k.a. number of tokens) of each page.
             It is a symbolic variable whose concrete value is specified
             at runtime.
-        support_sliding_window : tir.Var
+        support_sliding_window : tirx.Var
             0 or 1, denoting whether the KV cache supports sliding window.
             It is a symbolic variable whose concrete value is specified
             at runtime.
@@ -561,10 +579,11 @@ class TIRPagedKVCache(PagedKVCache):  # pylint: disable=too-few-public-methods
         target : Target
             The target to build the model to.
         """
-        attn_kind_single = attn_kind[0] if isinstance(attn_kind, List) else attn_kind
+        rope_scaling = _prepare_yarn_rope_scaling(rope_scaling, rope_theta)
+        attn_kind_single = attn_kind[0] if isinstance(attn_kind, list) else attn_kind
         if attn_kind_single == "mha_sliding":
             attn_kind_single = "mha"
-        if isinstance(attn_kind, List):
+        if isinstance(attn_kind, list):
             attn_kind = [int(getattr(AttnKind, layer_kind.upper())) for layer_kind in attn_kind]
         else:
             attn_kind = [
@@ -594,27 +613,30 @@ class TIRPagedKVCache(PagedKVCache):  # pylint: disable=too-few-public-methods
             rope_ext_factors,
             rx.op.zeros((), dtype),
             # pylint: disable=line-too-long
-            # fmt: off
-            bb.add_func(_kv_cache_transpose_append(num_key_value_heads, qk_head_dim, dtype), "kv_cache_transpose_append"),
-            bb.add_func(_kv_cache_transpose_append_mla(qk_head_dim, dtype), "kv_cache_transpose_append_mla"),
-            # fmt: on
+            bb.add_func(
+                _kv_cache_transpose_append(num_key_value_heads, qk_head_dim, dtype),
+                "kv_cache_transpose_append",
+            ),
+            bb.add_func(
+                _kv_cache_transpose_append_mla(qk_head_dim, dtype), "kv_cache_transpose_append_mla"
+            ),
             # pylint: enable=line-too-long
         ]
 
-        if str(target.kind) == "llvm":
+        if target.kind.name == "llvm":
             if attn_kind_single == "mla":
                 raise ValueError("MLA is not supported in TIR kernels for now.")
             # pylint: disable=line-too-long
             # fmt: off
             args.extend(
                 [
-                    rx.Tuple([rx.StringImm("tir"), bb.add_func(_attention_prefill_ragged_cpu(num_key_value_heads, num_attention_heads, qk_head_dim, v_head_dim, dtype, rope_scaling), "tir_attention_prefill_ragged_cpu")]),
-                    rx.Tuple([rx.StringImm("tir"), bb.add_func(_attention_prefill_cpu(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, False, rope_scaling), "tir_attention_prefill_cpu")]),
-                    rx.Tuple([rx.StringImm("tir"), bb.add_func(_attention_decode_cpu(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, False, rope_scaling), "tir_attention_decode_cpu")]),
-                    rx.Tuple([rx.StringImm("tir"), bb.add_func(_attention_prefill_cpu(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, True, rope_scaling), "tir_attention_prefill_cpu_sliding_window")]),
-                    rx.Tuple([rx.StringImm("tir"), bb.add_func(_attention_decode_cpu(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, True, rope_scaling), "tir_attention_decode_cpu_sliding_window")]),
-                    rx.Tuple([rx.StringImm("tir"), bb.add_func(tree_attn_cpu(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, rope_scaling), "tir_attention_prefill_with_tree_mask_cpu")]),
-                    rx.Tuple([rx.StringImm("tir"), bb.add_func(tree_attn_with_paged_kv_cache_cpu(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, rope_scaling), "tir_attention_prefill_with_tree_mask_with_paged_kv_cache_cpu")]),
+                    rx.Tuple([rx.StringImm("tirx"), bb.add_func(_attention_prefill_ragged_cpu(num_key_value_heads, num_attention_heads, qk_head_dim, v_head_dim, dtype, rope_scaling), "tir_attention_prefill_ragged_cpu")]),
+                    rx.Tuple([rx.StringImm("tirx"), bb.add_func(_attention_prefill_cpu(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, False, rope_scaling), "tir_attention_prefill_cpu")]),
+                    rx.Tuple([rx.StringImm("tirx"), bb.add_func(_attention_decode_cpu(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, False, rope_scaling), "tir_attention_decode_cpu")]),
+                    rx.Tuple([rx.StringImm("tirx"), bb.add_func(_attention_prefill_cpu(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, True, rope_scaling), "tir_attention_prefill_cpu_sliding_window")]),
+                    rx.Tuple([rx.StringImm("tirx"), bb.add_func(_attention_decode_cpu(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, True, rope_scaling), "tir_attention_decode_cpu_sliding_window")]),
+                    rx.Tuple([rx.StringImm("tirx"), bb.add_func(tree_attn_cpu(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, rope_scaling), "tir_attention_prefill_with_tree_mask_cpu")]),
+                    rx.Tuple([rx.StringImm("tirx"), bb.add_func(tree_attn_with_paged_kv_cache_cpu(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, rope_scaling), "tir_attention_prefill_with_tree_mask_with_paged_kv_cache_cpu")]),
                     rx.Tuple([]),  # f_mla_prefill
                     rx.Tuple([bb.add_func(_merge_state_inplace_cpu(dtype), "tir_attention_merge_state_cpu")]),
                     bb.add_func(llama_rope_with_position_map(rope_theta, rope_scale, qk_head_dim, num_attention_heads, num_key_value_heads, dtype, rope_scaling, rotary_dim), "tir_split_rotary"),
@@ -630,20 +652,20 @@ class TIRPagedKVCache(PagedKVCache):  # pylint: disable=too-few-public-methods
             # fmt: off
             ragged_qk_head_dim = qk_head_dim if attn_kind_single == "mha" else mla_original_qk_head_dim
             ragged_v_head_dim = v_head_dim if attn_kind_single == "mha" else mla_original_v_head_dim
-            args.append(rx.Tuple([rx.StringImm("tir"), bb.add_func(_attention_prefill_ragged(num_key_value_heads if attn_kind_single == "mha" else num_attention_heads, num_attention_heads, ragged_qk_head_dim, ragged_v_head_dim, dtype, rope_scaling, target), "tir_attention_prefill_ragged")]))
+            args.append(rx.Tuple([rx.StringImm("tirx"), bb.add_func(_attention_prefill_ragged(num_key_value_heads if attn_kind_single == "mha" else num_attention_heads, num_attention_heads, ragged_qk_head_dim, ragged_v_head_dim, dtype, rope_scaling, target), "tir_attention_prefill_ragged")]))
             mha_functions = (
                 [
-                    rx.Tuple([rx.StringImm("tir"), bb.add_func(_attention_prefill(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, False, rope_scaling, target), "tir_attention_prefill")]),
-                    rx.Tuple([rx.StringImm("tir"), bb.add_func(_attention_decode(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, False, rope_scaling, target), "tir_attention_decode")]),
-                    rx.Tuple([rx.StringImm("tir"), bb.add_func(_attention_prefill(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, True, rope_scaling, target), "tir_attention_prefill_sliding_window")]),
-                    rx.Tuple([rx.StringImm("tir"), bb.add_func(_attention_decode(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, True, rope_scaling, target), "tir_attention_decode_sliding_window")]),
-                    rx.Tuple([rx.StringImm("tir"), bb.add_func(tree_attn_with_paged_kv_cache(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, rope_scaling, target), "tir_attention_prefill_with_tree_mask_with_paged_kv_cache")]),
-                    rx.Tuple([rx.StringImm("tir"), bb.add_func(tree_attn(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, rope_scaling, target), "tir_attention_prefill_with_tree_mask")]),
+                    rx.Tuple([rx.StringImm("tirx"), bb.add_func(_attention_prefill(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, False, rope_scaling, target), "tir_attention_prefill")]),
+                    rx.Tuple([rx.StringImm("tirx"), bb.add_func(_attention_decode(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, False, rope_scaling, target), "tir_attention_decode")]),
+                    rx.Tuple([rx.StringImm("tirx"), bb.add_func(_attention_prefill(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, True, rope_scaling, target), "tir_attention_prefill_sliding_window")]),
+                    rx.Tuple([rx.StringImm("tirx"), bb.add_func(_attention_decode(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, True, rope_scaling, target), "tir_attention_decode_sliding_window")]),
+                    rx.Tuple([rx.StringImm("tirx"), bb.add_func(tree_attn_with_paged_kv_cache(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, rope_scaling, target), "tir_attention_prefill_with_tree_mask_with_paged_kv_cache")]),
+                    rx.Tuple([rx.StringImm("tirx"), bb.add_func(tree_attn(num_key_value_heads, num_attention_heads, qk_head_dim, dtype, rope_scaling, target), "tir_attention_prefill_with_tree_mask")]),
                 ]
                 if attn_kind_single == "mha"
                 else [rx.Tuple([]) for _ in range(6)]
             )
-            mla_function = rx.Tuple([rx.StringImm("tir"), bb.add_func(_attention_prefill_mla(num_attention_heads, v_head_dim, qk_head_dim - v_head_dim, dtype, False, target), "tir_attention_prefill_mla")] if attn_kind_single == "mla" else [])
+            mla_function = rx.Tuple([rx.StringImm("tirx"), bb.add_func(_attention_prefill_mla(num_attention_heads, v_head_dim, qk_head_dim - v_head_dim, dtype, False, target), "tir_attention_prefill_mla")] if attn_kind_single == "mla" else [])
             attn_merge_functions = [
                 bb.add_func(_merge_state_inplace(num_attention_heads, v_head_dim, dtype, target, "tir_attention_merge_state"), "tir_attention_merge_state"),
             ]
@@ -689,7 +711,7 @@ def _kv_cache_transpose_append(num_key_value_heads, head_dim, dtype, page_size: 
         var_v_data: T.handle,
         var_position_map: T.handle,
     ):
-        T.func_attr({"tir.noalias": True})
+        T.func_attr({"tirx.noalias": True})
         ntoken = T.SizeVar("num_tokens_excluding_cache", "int64")
         num_pages = T.int64()
         pages_elem_offset = T.int64()
@@ -702,13 +724,13 @@ def _kv_cache_transpose_append(num_key_value_heads, head_dim, dtype, page_size: 
         )
         for global_pos, h, f in T.grid(ntoken, num_key_value_heads, head_dim):
             if position_map[global_pos] != T.int32(-1):
-                with T.block("k_transpose_append"):
+                with T.sblock("k_transpose_append"):
                     vgpos, vh, vf = T.axis.remap("SSS", [global_pos, h, f])
                     T.reads(position_map[vgpos], k_data[vgpos, vh, vf])
                     T.writes(pages[position_map[vgpos] // page_size, 0, vh, position_map[vgpos] % page_size, vf])
                     position: T.int32 = position_map[vgpos]  # type: ignore
                     pages[T.floordiv(position, page_size), 0, vh, T.floormod(position, page_size), vf] = k_data[vgpos, vh, vf]
-                with T.block("v_transpose_append"):
+                with T.sblock("v_transpose_append"):
                     vgpos, vh, vf = T.axis.remap("SSS", [global_pos, h, f])
                     T.reads(position_map[vgpos], v_data[vgpos, vh, vf])
                     T.writes(pages[position_map[vgpos] // page_size, 1, vh, position_map[vgpos] % page_size, vf])
@@ -731,7 +753,7 @@ def _kv_cache_transpose_append_mla(d_qk: int, dtype, page_size: int = 16):
         var_kv_data: T.handle,
         var_position_map: T.handle,
     ):
-        T.func_attr({"tir.noalias": True})
+        T.func_attr({"tirx.noalias": True})
         ntoken = T.SizeVar("num_tokens_excluding_cache", "int64")
         num_pages = T.int64()
         pages_elem_offset = T.int64()
@@ -743,7 +765,7 @@ def _kv_cache_transpose_append_mla(d_qk: int, dtype, page_size: int = 16):
         )
         for global_pos, f in T.grid(ntoken, d_qk):
             if position_map[global_pos] != T.int32(-1):
-                with T.block("k_transpose_append"):
+                with T.sblock("k_transpose_append"):
                     vgpos, vf = T.axis.remap("SS", [global_pos, f])
                     T.reads(position_map[vgpos], kv_data[vgpos, vf])
                     T.writes(pages[position_map[vgpos] // page_size, position_map[vgpos] % page_size, vf])
@@ -768,7 +790,7 @@ def _kv_cache_debug_get_kv(num_hidden_layers, num_key_value_heads, head_dim, dty
         var_v_data: T.handle,
         layer_id: T.int64,
     ):
-        T.func_attr({"tir.noalias": True})
+        T.func_attr({"tirx.noalias": True})
         seqlen = T.SizeVar("num_tokens_including_cache", "int64")
         page_size = T.SizeVar("page_size", "int64")
         num_pages = T.int64()
@@ -781,7 +803,7 @@ def _kv_cache_debug_get_kv(num_hidden_layers, num_key_value_heads, head_dim, dty
         k_data = T.match_buffer(var_k_data, (num_hidden_layers, seqlen, num_key_value_heads, head_dim), dtype)
         v_data = T.match_buffer(var_v_data, (num_hidden_layers, seqlen, num_key_value_heads, head_dim), dtype)
         for p, h, d in T.grid(seqlen, num_key_value_heads, head_dim):
-            with T.block("copy0"):
+            with T.sblock("copy0"):
                 vp, vh, vd = T.axis.remap("SSS", [p, h, d])
                 T.reads(position_map[vp], pages[position_map[vp] // page_size, 0:2, vh, position_map[vp] % page_size, vd])
                 T.writes(k_data[layer_id, vp, vh, vd], v_data[layer_id, vp, vh, vd])
@@ -806,7 +828,7 @@ def _kv_cache_debug_get_kv_mla(num_hidden_layers, d_qk, dtype):
         var_compressed_kv_with_k_pe_data: T.handle,
         layer_id: T.int64,
     ):
-        T.func_attr({"tir.noalias": True})
+        T.func_attr({"tirx.noalias": True})
         seqlen = T.SizeVar("num_tokens_including_cache", "int64")
         page_size = T.SizeVar("page_size", "int64")
         num_pages = T.int64()
@@ -818,7 +840,7 @@ def _kv_cache_debug_get_kv_mla(num_hidden_layers, d_qk, dtype):
         )
         compressed_kv_with_k_pe_data = T.match_buffer(var_compressed_kv_with_k_pe_data, (num_hidden_layers, seqlen, d_qk), dtype)
         for p, d in T.grid(seqlen, d_qk):
-            with T.block("copy0"):
+            with T.sblock("copy0"):
                 vp, vd = T.axis.remap("SS", [p, d])
                 T.reads(position_map[vp], pages[position_map[vp] // page_size, position_map[vp] % page_size, vd])
                 T.writes(compressed_kv_with_k_pe_data[layer_id, vp, vd])
@@ -832,32 +854,32 @@ def _kv_cache_debug_get_kv_mla(num_hidden_layers, d_qk, dtype):
 
 def _rope(
     buffer: T.Buffer,
-    offset: tir.Var,
+    offset: tirx.Var,
     rotary_dim: int,
-    theta: tir.Var,
-    scale: tir.Var,
-    indices: Tuple[tir.Var, ...],
+    theta: tirx.Var,
+    scale: tirx.Var,
+    indices: tuple[tirx.Var, ...],
     qkv_dtype: str,
-    rope_scaling: Dict[str, Any],
+    rope_scaling: dict[str, Any],
 ):
     d = indices[-1]
     cos_freq, sin_freq, var_map = switch_rope_freq_func(rope_scaling)(
         offset * scale, d, rotary_dim, theta, "float32"
     )
     cos = cos_freq * buffer[indices].astype("float32")
-    sin = sin_freq * tir.if_then_else(
+    sin = sin_freq * tirx.if_then_else(
         d < rotary_dim // 2,
         -buffer[indices[:-1] + (d + rotary_dim // 2,)],
         buffer[indices[:-1] + (d - rotary_dim // 2,)],
     ).astype("float32")
     expr = (cos + sin).astype(qkv_dtype)
     for var, value in var_map.items():
-        expr = tir.Let(var, value, expr)
+        expr = tirx.Let(var, value, expr)
     return expr
 
 
 def _var(dtype):
-    return T.alloc_buffer((1,), dtype, scope="local")
+    return T.sblock_alloc_buffer((1,), dtype, scope="local")
 
 
 def _causal_mask(causal, row, col, kv_len, qo_len):
@@ -900,13 +922,14 @@ def _get_seq_offset(pos, seq_id, length_info, sliding_window):
 
 
 def _attention_prefill_cpu(
-    h_kv, h_q, d, dtype, sliding_window: bool, rope_scaling: Dict[str, Any], page_size: int = 16
+    h_kv, h_q, d, dtype, sliding_window: bool, rope_scaling: dict[str, Any], page_size: int = 16
 ):
     global_symbol = "batch_prefill_paged_kv_cpu"
     if sliding_window:
         global_symbol += "_sliding_window"
 
     group_size = h_q // h_kv
+
     # pylint: disable=line-too-long,too-many-branches
     # fmt: off
     @T.prim_func
@@ -961,20 +984,20 @@ def _attention_prefill_cpu(
 
         for h_qo in T.serial(h_q):
             for b_idx in T.serial(batch_size):
-                with T.block("attn"):
-                    O_local = T.alloc_buffer((d, ), "float32")
-                    Q_local = T.alloc_buffer((d, ), "float32")
-                    K_local = T.alloc_buffer((d, ), "float32")
-                    V_local = T.alloc_buffer((d, ), "float32")
+                with T.sblock("attn"):
+                    O_local = T.sblock_alloc_buffer((d, ), "float32")
+                    Q_local = T.sblock_alloc_buffer((d, ), "float32")
+                    K_local = T.sblock_alloc_buffer((d, ), "float32")
+                    V_local = T.sblock_alloc_buffer((d, ), "float32")
 
-                    kv_chunk_len = T.alloc_buffer((1, ), "int32")
+                    kv_chunk_len = T.sblock_alloc_buffer((1, ), "int32")
 
-                    m_val = T.alloc_buffer((1, ), "float32")
-                    new_m = T.alloc_buffer((1, ), "float32")
-                    d_val = T.alloc_buffer((1, ), "float32")
-                    S_val = T.alloc_buffer((1, ), "float32")
-                    scale_O = T.alloc_buffer((1, ), "float32")
-                    factor = T.alloc_buffer((1, ), "float32")
+                    m_val = T.sblock_alloc_buffer((1, ), "float32")
+                    new_m = T.sblock_alloc_buffer((1, ), "float32")
+                    d_val = T.sblock_alloc_buffer((1, ), "float32")
+                    S_val = T.sblock_alloc_buffer((1, ), "float32")
+                    scale_O = T.sblock_alloc_buffer((1, ), "float32")
+                    factor = T.sblock_alloc_buffer((1, ), "float32")
                     cur_page_indptr_begin: T.int32 = page_indptr[b_idx]
                     cur_page_indptr_end: T.int32 = page_indptr[b_idx + 1]
                     #max_kv_len: T.int32 = max_num_pages * page_size
@@ -1075,7 +1098,7 @@ def _get_prefill_kernel_config(h_kv, h_q, d, dtype, target: Target):
 
     # Otherwise we would exceed maxComputeWorkgroupStorageSize
     if (
-        str(target.kind) == "webgpu"
+        target.kind.name == "webgpu"
         and ((d + 127) // 128) * ((DataType(dtype).bits + 15) // 16) >= 4
     ):
         tile_z = 8
@@ -1092,7 +1115,7 @@ def _get_prefill_kernel_config(h_kv, h_q, d, dtype, target: Target):
 
 
 def _schedule_prefill_kernel(
-    sch: tir.Schedule,
+    sch: s_tir.Schedule,
     load_vec,
     bdx,
     num_warps,
@@ -1101,7 +1124,7 @@ def _schedule_prefill_kernel(
     tile_z,
     transform_k_load: bool,
     merged_qk_load: bool,
-) -> tir.Schedule:
+) -> tvm.s_tir.Schedule:
     get_extent = lambda *lps: [int(sch.get(lp).extent) for lp in lps]
 
     def get_vecsize(extent):
@@ -1114,14 +1137,14 @@ def _schedule_prefill_kernel(
     def get_tile_size(x, y, t):
         cnt = (x * y) // t
         assert (x * y) % t == 0
-        tile_y = (int)(math.ceil(math.sqrt(cnt)))
+        tile_y = math.ceil(math.sqrt(cnt))
         while (cnt % tile_y != 0 or y % tile_y != 0 or x % (cnt // tile_y) != 0) and tile_y <= cnt:
             tile_y += 1
         assert tile_y <= cnt
         tile_x = cnt // tile_y
         return tile_x, tile_y
 
-    def apply_to_qkv_load(sch: tir.Schedule, block):
+    def apply_to_qkv_load(sch: s_tir.Schedule, block):
         loop_x, loop_y = sch.get_loops(block)[-2:]
         x_extent, y_extent = get_extent(loop_x, loop_y)
         vec_size = getxy_vecsize(x_extent, y_extent, bdx * num_warps)
@@ -1137,7 +1160,7 @@ def _schedule_prefill_kernel(
         sch.bind(tx, "threadIdx.x")
         sch.vectorize(yv)
 
-    def apply_to_so_ewise(sch: tir.Schedule, block, tile):
+    def apply_to_so_ewise(sch: s_tir.Schedule, block, tile):
         loop_x, loop_y = sch.get_loops(block)[-2:]
         xo, xi = sch.split(loop_x, factors=[None, tile[0]])
         yo, yi = sch.split(loop_y, factors=[None, tile[1]])
@@ -1151,7 +1174,7 @@ def _schedule_prefill_kernel(
         sch.bind(ty, "threadIdx.y")
         sch.bind(tx, "threadIdx.x")
 
-    def apply_to_gemm(sch: tir.Schedule, block, tile, r_len=16, k_major=False):
+    def apply_to_gemm(sch: s_tir.Schedule, block, tile, r_len=16, k_major=False):
         loop_x, loop_y, loop_z = sch.get_loops(block)[-3:]
         xo, xi = sch.split(loop_x, factors=[None, tile[0]])
         yo, yi = sch.split(loop_y, factors=[None, tile[1]])
@@ -1183,18 +1206,18 @@ def _schedule_prefill_kernel(
         sch.transform_layout("K_load", ("write", 0), lambda i, j: (j, i))
     tile_s = get_tile_size(tile_x, tile_z, bdx * num_warps)
     tile_o = get_tile_size(tile_x, tile_y, bdx * num_warps)
-    apply_to_gemm(sch, sch.get_block("S_gemm"), tile_s, k_major=True)
-    apply_to_gemm(sch, sch.get_block("O_gemm"), tile_o, k_major=False)
-    apply_to_so_ewise(sch, sch.get_block("S_store"), tile_s)
-    apply_to_so_ewise(sch, sch.get_block("O_init"), tile_o)
-    apply_to_so_ewise(sch, sch.get_block("O_store"), tile_o)
-    apply_to_qkv_load(sch, sch.get_block("Q_load"))
+    apply_to_gemm(sch, sch.get_sblock("S_gemm"), tile_s, k_major=True)
+    apply_to_gemm(sch, sch.get_sblock("O_gemm"), tile_o, k_major=False)
+    apply_to_so_ewise(sch, sch.get_sblock("S_store"), tile_s)
+    apply_to_so_ewise(sch, sch.get_sblock("O_init"), tile_o)
+    apply_to_so_ewise(sch, sch.get_sblock("O_store"), tile_o)
+    apply_to_qkv_load(sch, sch.get_sblock("Q_load"))
     if not merged_qk_load:
-        apply_to_qkv_load(sch, sch.get_block("K_load"))
-        apply_to_qkv_load(sch, sch.get_block("V_load"))
+        apply_to_qkv_load(sch, sch.get_sblock("K_load"))
+        apply_to_qkv_load(sch, sch.get_sblock("V_load"))
     else:
-        apply_to_qkv_load(sch, sch.get_block("KV_load"))
-    apply_to_md(sch, sch.get_block("lse_store"))
+        apply_to_qkv_load(sch, sch.get_sblock("KV_load"))
+    apply_to_md(sch, sch.get_sblock("lse_store"))
     return sch
 
 
@@ -1204,7 +1227,7 @@ def _attention_prefill(
     d,
     dtype,
     sliding_window: bool,
-    rope_scaling: Dict[str, Any],
+    rope_scaling: dict[str, Any],
     target: Target,
     page_size: int = 16,
 ):
@@ -1280,7 +1303,7 @@ def _attention_prefill(
             for lby in T.thread_binding(h_kv, thread="blockIdx.y"):
                 for lty in T.thread_binding(num_warps, thread="threadIdx.y"):
                     for ltx in T.thread_binding(bdx, thread="threadIdx.x"):
-                        with T.block("attn"):
+                        with T.sblock("attn"):
                             bx, by, ty, tx = T.axis.remap("SSSS", [lbx, lby, lty, ltx])
                             T.reads()
                             T.writes()
@@ -1291,21 +1314,21 @@ def _attention_prefill(
                             iterator = _var("int32")
                             kv_chunk_len = _var("int32")
 
-                            Q_smem = T.alloc_buffer((tile_x, d), dtype, scope="shared")
-                            K_smem = T.alloc_buffer((tile_z, d), dtype, scope="shared")
-                            V_smem = T.alloc_buffer((tile_z, d), dtype, scope="shared")
-                            S_smem = T.alloc_buffer((tile_x, tile_z), "float32", scope="shared")
+                            Q_smem = T.sblock_alloc_buffer((tile_x, d), dtype, scope="shared")
+                            K_smem = T.sblock_alloc_buffer((tile_z, d), dtype, scope="shared")
+                            V_smem = T.sblock_alloc_buffer((tile_z, d), dtype, scope="shared")
+                            S_smem = T.sblock_alloc_buffer((tile_x, tile_z), "float32", scope="shared")
 
-                            S_local = T.alloc_buffer((tile_x, tile_z), "float32", scope="local")
-                            O_local = T.alloc_buffer((tile_x, d), "float32", scope="local")
+                            S_local = T.sblock_alloc_buffer((tile_x, tile_z), "float32", scope="local")
+                            O_local = T.sblock_alloc_buffer((tile_x, d), "float32", scope="local")
 
-                            m_smem = T.alloc_buffer((tile_x, ), "float32", scope="shared")
-                            m_prev_smem = T.alloc_buffer((tile_x, ), "float32", scope="shared")
-                            d_smem = T.alloc_buffer((tile_x, ), "float32", scope="shared")
+                            m_smem = T.sblock_alloc_buffer((tile_x, ), "float32", scope="shared")
+                            m_prev_smem = T.sblock_alloc_buffer((tile_x, ), "float32", scope="shared")
+                            d_smem = T.sblock_alloc_buffer((tile_x, ), "float32", scope="shared")
 
-                            m_new = T.alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
-                            m_prev = T.alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
-                            d_new = T.alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
+                            m_new = T.sblock_alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
+                            m_prev = T.sblock_alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
+                            d_new = T.sblock_alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
 
                             ## get tile_no, batch_idx, batch_tiles, batch_rows
                             tile_id[0] = bx
@@ -1344,14 +1367,14 @@ def _attention_prefill(
                                             d_smem[row] = 1.0
 
                                     for li, lj in T.grid(tile_x, tile_y):
-                                        with T.block("O_init"):
+                                        with T.sblock("O_init"):
                                             i, j = T.axis.remap("SS", [li, lj])
                                             O_local[i, j] = 0.0
                                     T.tvm_storage_sync("shared")
 
                                     # Load Q from gmem to smem
                                     for li, lj in T.grid(tile_x, tile_y):
-                                        with T.block("Q_load"):
+                                        with T.sblock("Q_load"):
                                             i, j = T.axis.remap("SS", [li, lj])
                                             T.reads()
                                             T.writes()
@@ -1370,7 +1393,7 @@ def _attention_prefill(
                                     for iterator in T.serial(T.ceildiv(kv_chunk_len[0], tile_z)):
                                         L_kv_start: T.int32 = iterator * tile_z
                                         for lz, ly in T.grid(tile_z, tile_y):
-                                            with T.block("K_load"):
+                                            with T.sblock("K_load"):
                                                 i, j = T.axis.remap("SS", [lz, ly])
                                                 T.reads()
                                                 T.writes()
@@ -1388,7 +1411,7 @@ def _attention_prefill(
                                                     K_smem[i, j] = 0.0
                                         T.tvm_storage_sync("shared")
                                         for lz, ly in T.grid(tile_z, tile_y):
-                                            with T.block("V_load"):
+                                            with T.sblock("V_load"):
                                                 i, j = T.axis.remap("SS", [lz, ly])
                                                 T.reads()
                                                 T.writes()
@@ -1403,16 +1426,16 @@ def _attention_prefill(
                                         T.tvm_storage_sync("shared")
 
                                         # Compute S
-                                        with T.block():
+                                        with T.sblock():
                                             for li, lj, lk in T.grid(tile_x, tile_z, tile_y):
-                                                with T.block("S_gemm"):
+                                                with T.sblock("S_gemm"):
                                                     i, j, k = T.axis.remap("SSR", [li, lj, lk])
                                                     with T.init():
                                                         S_local[i, j] = 0.0
                                                     S_local[i, j] += T.cast(Q_smem[i, k], "float32") * T.cast(K_smem[j, k], "float32") * sm_scale * math.log2(math.exp(1))
                                         T.tvm_storage_sync("shared")
                                         for li, lj in T.grid(tile_x, tile_z):
-                                            with T.block("S_store"):
+                                            with T.sblock("S_store"):
                                                 i, j = T.axis.remap("SS", [li, lj])
                                                 S_smem[i, j] = S_local[i, j]
                                         T.tvm_storage_sync("shared")
@@ -1421,7 +1444,7 @@ def _attention_prefill(
                                         for i in T.serial(T.ceildiv(tile_x, bdx * num_warps)):
                                             row: T.int32 = i * bdx * num_warps + ty * bdx + tx
                                             if row < tile_x:
-                                                with T.block("update1"):
+                                                with T.sblock("update1"):
                                                     m_prev[i] = m_smem[row]
                                                     m_new[i] = m_smem[row]
                                                     # mask out of kv_chunk_len S
@@ -1437,7 +1460,7 @@ def _attention_prefill(
 
                                         for i in T.serial(T.ceildiv(tile_x, bdx * num_warps)):
                                             row: T.int32 = i * bdx * num_warps + ty * bdx + tx
-                                            with T.block("update"):
+                                            with T.sblock("update"):
                                                 for j in T.serial(tile_z):
                                                     # this is to avoid sync inside condition branch
                                                     if row < tile_x:
@@ -1454,7 +1477,7 @@ def _attention_prefill(
                                         for i in T.serial(T.ceildiv(tile_x, bdx * num_warps)):
                                             row: T.int32 = i * bdx * num_warps + ty * bdx + tx
                                             if row < tile_x:
-                                                with T.block("update"):
+                                                with T.sblock("update"):
                                                     for j in T.serial(tile_z):
                                                         d_new[i] += S_smem[row, j]
                                                     m_smem[row] = m_new[i]
@@ -1463,9 +1486,9 @@ def _attention_prefill(
                                         T.tvm_storage_sync("shared")
 
                                         # Update O
-                                        with T.block():
+                                        with T.sblock():
                                             for li, lj, lk in T.grid(tile_x, tile_y, tile_z):
-                                                with T.block("O_gemm"):
+                                                with T.sblock("O_gemm"):
                                                     i, j, k = T.axis.remap("SSR", [li, lj, lk])
                                                     with T.init():
                                                         O_local[i, j] *= T.exp2(m_prev_smem[i] - m_smem[i])
@@ -1473,7 +1496,7 @@ def _attention_prefill(
 
                                     # Store O from smem to gmem
                                     for li, lj in T.grid(tile_x, tile_y):
-                                        with T.block("O_store"):
+                                        with T.sblock("O_store"):
                                             i, j = T.axis.remap("SS", [li, lj])
                                             cur_L: T.int32 = q_indptr[b_idx] + (LH_start + i) // group_size
                                             cur_H_qo: T.int32 = by * group_size + (LH_start + i) % group_size
@@ -1482,7 +1505,7 @@ def _attention_prefill(
 
                                     # Store LSE to gmem
                                     for li in T.grid(tile_x):
-                                        with T.block("lse_store"):
+                                        with T.sblock("lse_store"):
                                             i = T.axis.remap("S", [li])
                                             cur_L: T.int32 = q_indptr[b_idx] + (LH_start + i) // group_size
                                             cur_H_qo: T.int32 = by * group_size + (LH_start + i) % group_size
@@ -1493,11 +1516,11 @@ def _attention_prefill(
                                     tile_id[0] += NUM_BLKS
     # fmt: on
     # pylint: enable=line-too-long,too-many-branches
-    sch = tir.Schedule(batch_prefill_paged_kv)
+    sch = tvm.s_tir.Schedule(batch_prefill_paged_kv)
     sch = _schedule_prefill_kernel(
         sch, LOAD_VEC, bdx, num_warps, tile_x, tile_y, tile_z, False, False
     )
-    return sch.mod["main"].with_attr("tir.is_scheduled", True)
+    return sch.mod["main"].with_attr("tirx.is_scheduled", True)
 
 
 def _attention_decode_cpu(
@@ -1506,7 +1529,7 @@ def _attention_decode_cpu(
     head_dim,
     qkv_dtype,
     sliding_window: bool,
-    rope_scaling: Dict[str, Any],
+    rope_scaling: dict[str, Any],
     page_size: int = 16,
 ):
     H_qo = num_qo_heads
@@ -1536,7 +1559,7 @@ def _attention_decode_cpu(
         rope_theta: T.float32,
         sm_scale: T.float32,
     ):
-        T.func_attr({"tir.is_scheduled": True, "global_symbol": global_symbol})
+        T.func_attr({"tirx.is_scheduled": True, "global_symbol": global_symbol})
         B = T.int32(is_size_var=True)
         nnz_pages = T.int32(is_size_var=True)
         max_num_pages = T.int32(is_size_var=True)
@@ -1575,20 +1598,20 @@ def _attention_decode_cpu(
         )
 
         for b in T.serial(B):
-            with T.block("attn"):
-                O_local = T.alloc_buffer((D,), "float32")
-                Q_local = T.alloc_buffer((D,), "float32")
-                K_local = T.alloc_buffer((D,), "float32")
-                V_local = T.alloc_buffer((D,), "float32")
+            with T.sblock("attn"):
+                O_local = T.sblock_alloc_buffer((D,), "float32")
+                Q_local = T.sblock_alloc_buffer((D,), "float32")
+                K_local = T.sblock_alloc_buffer((D,), "float32")
+                V_local = T.sblock_alloc_buffer((D,), "float32")
 
-                kv_chunk_len = T.alloc_buffer((1,), "int32")
+                kv_chunk_len = T.sblock_alloc_buffer((1,), "int32")
 
-                m_val = T.alloc_buffer((1,), "float32")
-                new_m = T.alloc_buffer((1,), "float32")
-                d_val = T.alloc_buffer((1,), "float32")
-                S_val = T.alloc_buffer((1,), "float32")
-                scale_O = T.alloc_buffer((1,), "float32")
-                factor = T.alloc_buffer((1,), "float32")
+                m_val = T.sblock_alloc_buffer((1,), "float32")
+                new_m = T.sblock_alloc_buffer((1,), "float32")
+                d_val = T.sblock_alloc_buffer((1,), "float32")
+                S_val = T.sblock_alloc_buffer((1,), "float32")
+                scale_O = T.sblock_alloc_buffer((1,), "float32")
+                factor = T.sblock_alloc_buffer((1,), "float32")
 
                 cur_page_indptr_begin: T.int32 = page_table_indptr[b]
                 cur_page_indptr_end: T.int32 = page_table_indptr[b + 1]
@@ -1662,7 +1685,7 @@ def _attention_decode(
     head_dim,
     qkv_dtype,
     sliding_window: bool,
-    rope_scaling: Dict[str, Any],
+    rope_scaling: dict[str, Any],
     target: Target,
     page_size: int = 16,
 ):
@@ -1717,7 +1740,7 @@ def _attention_decode(
         rope_theta: T.float32,
         sm_scale: T.float32,
     ):
-        T.func_attr({"tir.is_scheduled": True, "global_symbol": global_symbol})
+        T.func_attr({"tirx.is_scheduled": True, "global_symbol": global_symbol})
         B = T.int32(is_size_var=True)
         nnz_pages = T.int32(is_size_var=True)
         max_num_pages = T.int32(is_size_var=True)
@@ -1753,29 +1776,29 @@ def _attention_decode(
                 for ty in T.thread_binding(bdy, thread="threadIdx.y"):
                     for tx in T.thread_binding(bdx, thread="threadIdx.x"):
                         for tz in T.thread_binding(bdz, thread="threadIdx.z"):
-                            with T.block("attn"):
-                                Q_local = T.alloc_buffer((VEC_SIZE,), qkv_dtype, scope="local")
-                                kv_chunk_len = T.alloc_buffer((1,), "int32", scope="local")
-                                K_smem = T.alloc_buffer((bdz * bdy * tile_size_per_bdx, D), qkv_dtype, scope="shared")
-                                V_smem = T.alloc_buffer((bdz * bdy * tile_size_per_bdx, D), qkv_dtype, scope="shared")
-                                O_allreduce = T.alloc_buffer((bdz, bdy, D), "float32", scope="shared")
-                                md_allreduce = T.alloc_buffer((bdz, bdy, 2), "float32", scope="shared")
-                                S_reduce_local = T.alloc_buffer((1,), "float32", scope="local")
-                                t0 = T.alloc_buffer((1,), "float32", scope="local")
+                            with T.sblock("attn"):
+                                Q_local = T.sblock_alloc_buffer((VEC_SIZE,), qkv_dtype, scope="local")
+                                kv_chunk_len = T.sblock_alloc_buffer((1,), "int32", scope="local")
+                                K_smem = T.sblock_alloc_buffer((bdz * bdy * tile_size_per_bdx, D), qkv_dtype, scope="shared")
+                                V_smem = T.sblock_alloc_buffer((bdz * bdy * tile_size_per_bdx, D), qkv_dtype, scope="shared")
+                                O_allreduce = T.sblock_alloc_buffer((bdz, bdy, D), "float32", scope="shared")
+                                md_allreduce = T.sblock_alloc_buffer((bdz, bdy, 2), "float32", scope="shared")
+                                S_reduce_local = T.sblock_alloc_buffer((1,), "float32", scope="local")
+                                t0 = T.sblock_alloc_buffer((1,), "float32", scope="local")
 
-                                S_local = T.alloc_buffer((bdy * tile_size_per_bdx), "float32", scope="local")
-                                QK_local = T.alloc_buffer((VEC_SIZE,), "float32", scope="local")
-                                V_local = T.alloc_buffer((VEC_SIZE,), qkv_dtype, scope="local")
-                                m_prev = T.alloc_buffer((1,), "float32", scope="local")
-                                d_prev = T.alloc_buffer((1,), "float32", scope="local")
-                                other_m = T.alloc_buffer((1,), "float32", scope="local")
-                                other_d = T.alloc_buffer((1,), "float32", scope="local")
-                                exp_mprev = T.alloc_buffer((1,), "float32", scope="local")
-                                exp_otherm = T.alloc_buffer((1,), "float32", scope="local")
-                                other_o = T.alloc_buffer((VEC_SIZE,), "float32", scope="local")
-                                st_m = T.alloc_buffer((1,), "float32", scope="local")
-                                st_d = T.alloc_buffer((1,), "float32", scope="local")
-                                O_local = T.alloc_buffer((VEC_SIZE,), "float32", scope="local")
+                                S_local = T.sblock_alloc_buffer((bdy * tile_size_per_bdx), "float32", scope="local")
+                                QK_local = T.sblock_alloc_buffer((VEC_SIZE,), "float32", scope="local")
+                                V_local = T.sblock_alloc_buffer((VEC_SIZE,), qkv_dtype, scope="local")
+                                m_prev = T.sblock_alloc_buffer((1,), "float32", scope="local")
+                                d_prev = T.sblock_alloc_buffer((1,), "float32", scope="local")
+                                other_m = T.sblock_alloc_buffer((1,), "float32", scope="local")
+                                other_d = T.sblock_alloc_buffer((1,), "float32", scope="local")
+                                exp_mprev = T.sblock_alloc_buffer((1,), "float32", scope="local")
+                                exp_otherm = T.sblock_alloc_buffer((1,), "float32", scope="local")
+                                other_o = T.sblock_alloc_buffer((VEC_SIZE,), "float32", scope="local")
+                                st_m = T.sblock_alloc_buffer((1,), "float32", scope="local")
+                                st_d = T.sblock_alloc_buffer((1,), "float32", scope="local")
+                                O_local = T.sblock_alloc_buffer((VEC_SIZE,), "float32", scope="local")
 
                                 by: T.int32 = fused_by_bz % H_kv
                                 bz: T.int32 = fused_by_bz // H_kv
@@ -1807,7 +1830,7 @@ def _attention_decode(
                                     tile_start_g: T.int32(is_size_var=True) = ((iterator * bdz + tz) * bdy + ty) * tile_size_per_bdx  # type: ignore
                                     # load KV from global memory to shared memory
                                     for j in T.serial(tile_size_per_bdx):
-                                        with T.block("KV_load"):
+                                        with T.sblock("KV_load"):
                                             T.reads()
                                             T.writes()
                                             row_g: T.int32(is_size_var=True) = tile_start_g + j  # type: ignore
@@ -1837,7 +1860,7 @@ def _attention_decode(
                                         for vec in T.unroll(VEC_SIZE):
                                             S_reduce_local[0] += QK_local[vec]
 
-                                        with T.block("block_cross_thread"):
+                                        with T.sblock("block_cross_thread"):
                                             T.reads(S_reduce_local[0])
                                             T.writes(t0[0])
                                             T.attr(
@@ -1920,7 +1943,7 @@ def _merge_state_inplace_cpu(v_dtype):
         v_other: T.handle,
         s_other: T.handle,
     ):
-        T.func_attr({"tir.is_scheduled": True})
+        T.func_attr({"tirx.is_scheduled": True})
         N = T.int32(is_size_var=True)
         H = T.int32(is_size_var=True)
         D = T.int32(is_size_var=True)
@@ -1932,7 +1955,7 @@ def _merge_state_inplace_cpu(v_dtype):
 
         for n in T.serial(N):
             for h in T.serial(H):
-                with T.block("merge"):
+                with T.sblock("merge"):
                     s_val = _var_cpu("float32")
                     s_other_val = _var_cpu("float32")
                     s_max = _var_cpu("float32")
@@ -1954,7 +1977,7 @@ def _merge_state_inplace_cpu(v_dtype):
 
 
 def _merge_state_inplace(
-    num_heads, head_dim, v_dtype, target: Target, global_symbol: Optional[str] = None
+    num_heads, head_dim, v_dtype, target: Target, global_symbol: str | None = None
 ):
     v_dtype_bytes = 2
     VEC_SIZE = min(max(8 // v_dtype_bytes, head_dim // 32), 4)
@@ -1973,7 +1996,7 @@ def _merge_state_inplace(
         v_other: T.handle,
         s_other: T.handle,
     ):
-        T.func_attr({"tir.is_scheduled": True})
+        T.func_attr({"tirx.is_scheduled": True})
         N = T.int32(is_size_var=True)
         H = T.int32(is_size_var=True)
         D = T.int32(is_size_var=True)
@@ -1987,15 +2010,15 @@ def _merge_state_inplace(
             for by in T.thread_binding(gdy, thread="blockIdx.y"):
                 for ty in T.thread_binding(bdy, thread="threadIdx.y"):
                     for tx in T.thread_binding(bdx, thread="threadIdx.x"):
-                        with T.block("merge"):
+                        with T.sblock("merge"):
                             s_val = _var("float32")
                             s_other_val = _var("float32")
                             s_max = _var("float32")
                             scale = _var("float32")
                             other_scale = _var("float32")
 
-                            v_vec = T.alloc_buffer((VEC_SIZE,), v_dtype, scope="local")
-                            v_other_vec = T.alloc_buffer((VEC_SIZE,), v_dtype, scope="local")
+                            v_vec = T.sblock_alloc_buffer((VEC_SIZE,), v_dtype, scope="local")
+                            v_other_vec = T.sblock_alloc_buffer((VEC_SIZE,), v_dtype, scope="local")
 
                             s_val[0] = S[bx, ty + by * bdy]
                             s_other_val[0] = S_other[bx, ty + by * bdy]
@@ -2031,9 +2054,7 @@ def _merge_state_inplace(
     return func
 
 
-def _attention_sequence_prefill(
-    h_kv, h_q, d, dtype, target: Target, causal=0, sm_scale=1.0
-):  # pylint: disable=line-too-long
+def _attention_sequence_prefill(h_kv, h_q, d, dtype, target: Target, causal=0, sm_scale=1.0):  # pylint: disable=line-too-long
     (
         _,
         LOAD_VEC,
@@ -2070,30 +2091,30 @@ def _attention_sequence_prefill(
             for lby in T.thread_binding(h_kv, thread="blockIdx.y"):
                 for lty in T.thread_binding(num_warps, thread="threadIdx.y"):
                     for ltx in T.thread_binding(bdx, thread="threadIdx.x"):
-                        with T.block("attn"):
+                        with T.sblock("attn"):
                             vbx, by, ty, tx = T.axis.remap("SSSS", [lbx, lby, lty, ltx])
                             T.reads()
                             T.writes()
 
-                            Q_smem = T.alloc_buffer((tile_x, d), dtype, scope="shared")
-                            K_smem = T.alloc_buffer((tile_z, d), dtype, scope="shared")
-                            V_smem = T.alloc_buffer((tile_z, d), dtype, scope="shared")
-                            S_smem = T.alloc_buffer((tile_x, tile_z), "float32", scope="shared")
+                            Q_smem = T.sblock_alloc_buffer((tile_x, d), dtype, scope="shared")
+                            K_smem = T.sblock_alloc_buffer((tile_z, d), dtype, scope="shared")
+                            V_smem = T.sblock_alloc_buffer((tile_z, d), dtype, scope="shared")
+                            S_smem = T.sblock_alloc_buffer((tile_x, tile_z), "float32", scope="shared")
 
-                            S_local = T.alloc_buffer((tile_x, tile_z), "float32", scope="local")
-                            O_local = T.alloc_buffer((tile_x, d), "float32", scope="local")
+                            S_local = T.sblock_alloc_buffer((tile_x, tile_z), "float32", scope="local")
+                            O_local = T.sblock_alloc_buffer((tile_x, d), "float32", scope="local")
 
-                            m_smem = T.alloc_buffer((tile_x,), "float32", scope="shared")
-                            m_prev_smem = T.alloc_buffer((tile_x,), "float32", scope="shared")
-                            d_smem = T.alloc_buffer((tile_x,), "float32", scope="shared")
+                            m_smem = T.sblock_alloc_buffer((tile_x,), "float32", scope="shared")
+                            m_prev_smem = T.sblock_alloc_buffer((tile_x,), "float32", scope="shared")
+                            d_smem = T.sblock_alloc_buffer((tile_x,), "float32", scope="shared")
 
-                            m_new = T.alloc_buffer(
+                            m_new = T.sblock_alloc_buffer(
                                 (math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local"
                             )
-                            m_prev = T.alloc_buffer(
+                            m_prev = T.sblock_alloc_buffer(
                                 (math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local"
                             )
-                            d_new = T.alloc_buffer(
+                            d_new = T.sblock_alloc_buffer(
                                 (math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local"
                             )
 
@@ -2110,14 +2131,14 @@ def _attention_sequence_prefill(
                                     d_smem[row] = 1.0
 
                             for li, lj in T.grid(tile_x, tile_y):
-                                with T.block("O_init"):
+                                with T.sblock("O_init"):
                                     i, j = T.axis.remap("SS", [li, lj])
                                     O_local[i, j] = 0.0
                             T.tvm_storage_sync("shared")
 
                             # Load Q from gmem to smem
                             for li, lj in T.grid(tile_x, tile_y):
-                                with T.block("Q_load"):
+                                with T.sblock("Q_load"):
                                     i, j = T.axis.remap("SS", [li, lj])
                                     T.reads()
                                     T.writes()
@@ -2133,7 +2154,7 @@ def _attention_sequence_prefill(
                                 L_kv_start: T.int32 = iterator * tile_z
                                 L_kv_base: T.int32 = 0
                                 for lz, ly in T.grid(tile_z, tile_y):
-                                    with T.block("K_load"):
+                                    with T.sblock("K_load"):
                                         i, j = T.axis.remap("SS", [lz, ly])
                                         T.reads()
                                         T.writes()
@@ -2146,7 +2167,7 @@ def _attention_sequence_prefill(
                                             K_smem[i, j] = 0.0
                                 T.tvm_storage_sync("shared")
                                 for lz, ly in T.grid(tile_z, tile_y):
-                                    with T.block("V_load"):
+                                    with T.sblock("V_load"):
                                         i, j = T.axis.remap("SS", [lz, ly])
                                         T.reads()
                                         T.writes()
@@ -2160,9 +2181,9 @@ def _attention_sequence_prefill(
                                 T.tvm_storage_sync("shared")
 
                                 # Compute S
-                                with T.block():
+                                with T.sblock():
                                     for li, lj, lk in T.grid(tile_x, tile_z, tile_y):
-                                        with T.block("S_gemm"):
+                                        with T.sblock("S_gemm"):
                                             i, j, k = T.axis.remap("SSR", [li, lj, lk])
                                             with T.init():
                                                 S_local[i, j] = 0.0
@@ -2174,7 +2195,7 @@ def _attention_sequence_prefill(
                                             )
                                 T.tvm_storage_sync("shared")
                                 for li, lj in T.grid(tile_x, tile_z):
-                                    with T.block("S_store"):
+                                    with T.sblock("S_store"):
                                         i, j = T.axis.remap("SS", [li, lj])
                                         S_smem[i, j] = S_local[i, j]
                                 T.tvm_storage_sync("shared")
@@ -2183,7 +2204,7 @@ def _attention_sequence_prefill(
                                 for i in T.serial(T.ceildiv(tile_x, bdx * num_warps)):
                                     row: T.int32 = i * bdx * num_warps + ty * bdx + tx
                                     if row < tile_x:
-                                        with T.block("update1"):
+                                        with T.sblock("update1"):
                                             m_prev[i] = m_smem[row]
                                             m_new[i] = m_smem[row]
                                             # mask out of kv_chunk_len S
@@ -2205,7 +2226,7 @@ def _attention_sequence_prefill(
 
                                 for i in T.serial(T.ceildiv(tile_x, bdx * num_warps)):
                                     row: T.int32 = i * bdx * num_warps + ty * bdx + tx
-                                    with T.block("update"):
+                                    with T.sblock("update"):
                                         for j in T.serial(tile_z):
                                             # this is to avoid sync inside condition branch
                                             if row < tile_x:
@@ -2228,7 +2249,7 @@ def _attention_sequence_prefill(
                                 for i in T.serial(T.ceildiv(tile_x, bdx * num_warps)):
                                     row: T.int32 = i * bdx * num_warps + ty * bdx + tx
                                     if row < tile_x:
-                                        with T.block("update"):
+                                        with T.sblock("update"):
                                             for j in T.serial(tile_z):
                                                 d_new[i] += S_smem[row, j]
                                             m_smem[row] = m_new[i]
@@ -2237,9 +2258,9 @@ def _attention_sequence_prefill(
                                 T.tvm_storage_sync("shared")
 
                                 # Update O
-                                with T.block():
+                                with T.sblock():
                                     for li, lj, lk in T.grid(tile_x, tile_y, tile_z):
-                                        with T.block("O_gemm"):
+                                        with T.sblock("O_gemm"):
                                             i, j, k = T.axis.remap("SSR", [li, lj, lk])
                                             with T.init():
                                                 O_local[i, j] *= T.exp2(
@@ -2251,7 +2272,7 @@ def _attention_sequence_prefill(
 
                             # Store O from smem to gmem
                             for li, lj in T.grid(tile_x, tile_y):
-                                with T.block("O_store"):
+                                with T.sblock("O_store"):
                                     i, j = T.axis.remap("SS", [li, lj])
                                     cur_L: T.int32 = 0 + (LH_start + i) // group_size
                                     cur_H_qo: T.int32 = (
@@ -2264,7 +2285,7 @@ def _attention_sequence_prefill(
 
                             # Store LSE to gmem
                             for li in T.grid(tile_x):
-                                with T.block("lse_store"):
+                                with T.sblock("lse_store"):
                                     i = T.axis.remap("S", [li])
                                     cur_L: T.int32 = 0 + (LH_start + i) // group_size
                                     cur_H_qo: T.int32 = (
@@ -2277,14 +2298,14 @@ def _attention_sequence_prefill(
 
     # fmt: on
     # pylint: enable=line-too-long,too-many-branches
-    sch = tir.Schedule(batch_sequence_prefill_kv)
+    sch = tvm.s_tir.Schedule(batch_sequence_prefill_kv)
     sch = _schedule_prefill_kernel(
         sch, LOAD_VEC, bdx, num_warps, tile_x, tile_y, tile_z, False, False
     )
-    return sch.mod["main"].with_attr("tir.is_scheduled", True)
+    return sch.mod["main"].with_attr("tirx.is_scheduled", True)
 
 
-def _attention_prefill_ragged_cpu(h_kv, h_q, d_qk, d_v, dtype, rope_scaling: Dict[str, Any]):
+def _attention_prefill_ragged_cpu(h_kv, h_q, d_qk, d_v, dtype, rope_scaling: dict[str, Any]):
     group_size = h_q // h_kv
 
     # fmt: off
@@ -2333,20 +2354,20 @@ def _attention_prefill_ragged_cpu(h_kv, h_q, d_qk, d_v, dtype, rope_scaling: Dic
         lse = T.match_buffer(var_lse, (qo_len, h_q), "float32")  # pylint: disable=unused-variable
 
         for b in T.serial(batch_size):
-            with T.block("attn"):
-                softmax_sum = T.alloc_buffer([h_q], "float32")
-                m_prev = T.alloc_buffer([h_q], "float32")
-                m_new = T.alloc_buffer([h_q], "float32")
-                d_prev = T.alloc_buffer([h_q], "float32")
-                d_new = T.alloc_buffer([h_q], "float32")
-                p_sum = T.alloc_buffer([d_v], "float32")
-                max_score = T.alloc_buffer([h_q], "float32")
-                attention_scores = T.alloc_buffer([kv_len, h_q], "float32")
-                exp_scores = T.alloc_buffer([kv_len, h_q], "float32")
-                attention_score = T.alloc_buffer([1], "float32")
-                query_val = T.alloc_buffer([1], "float32")
-                key_val = T.alloc_buffer([1], "float32")
-                result = T.alloc_buffer([1], "float32")
+            with T.sblock("attn"):
+                softmax_sum = T.sblock_alloc_buffer([h_q], "float32")
+                m_prev = T.sblock_alloc_buffer([h_q], "float32")
+                m_new = T.sblock_alloc_buffer([h_q], "float32")
+                d_prev = T.sblock_alloc_buffer([h_q], "float32")
+                d_new = T.sblock_alloc_buffer([h_q], "float32")
+                p_sum = T.sblock_alloc_buffer([d_v], "float32")
+                max_score = T.sblock_alloc_buffer([h_q], "float32")
+                attention_scores = T.sblock_alloc_buffer([kv_len, h_q], "float32")
+                exp_scores = T.sblock_alloc_buffer([kv_len, h_q], "float32")
+                attention_score = T.sblock_alloc_buffer([1], "float32")
+                query_val = T.sblock_alloc_buffer([1], "float32")
+                key_val = T.sblock_alloc_buffer([1], "float32")
+                result = T.sblock_alloc_buffer([1], "float32")
 
                 for q_idx in T.serial(q_indptr[b + 1] - q_indptr[b]):
                     for i in T.serial(h_q):
@@ -2416,7 +2437,7 @@ def _attention_prefill_ragged_cpu(h_kv, h_q, d_qk, d_v, dtype, rope_scaling: Dic
 
 
 def _attention_prefill_ragged(
-    h_kv, h_q, d_qk, d_v, dtype, rope_scaling: Dict[str, Any], target: Target
+    h_kv, h_q, d_qk, d_v, dtype, rope_scaling: dict[str, Any], target: Target
 ):
     # pylint: disable=line-too-long
     (
@@ -2471,7 +2492,7 @@ def _attention_prefill_ragged(
             for lby in T.thread_binding(h_kv, thread="blockIdx.y"):
                 for lty in T.thread_binding(num_warps, thread="threadIdx.y"):
                     for ltx in T.thread_binding(bdx, thread="threadIdx.x"):
-                        with T.block("attn"):
+                        with T.sblock("attn"):
                             bx, by, ty, tx = T.axis.remap("SSSS", [lbx, lby, lty, ltx])
                             T.reads()
                             T.writes()
@@ -2482,21 +2503,21 @@ def _attention_prefill_ragged(
                             iterator = _var("int32")
                             kv_chunk_len = _var("int32")
 
-                            Q_smem = T.alloc_buffer((tile_x, d_qk), dtype, scope="shared")
-                            K_smem = T.alloc_buffer((tile_z, d_qk), dtype, scope="shared")
-                            V_smem = T.alloc_buffer((tile_z, d_v), dtype, scope="shared")
-                            S_smem = T.alloc_buffer((tile_x, tile_z), "float32", scope="shared")
+                            Q_smem = T.sblock_alloc_buffer((tile_x, d_qk), dtype, scope="shared")
+                            K_smem = T.sblock_alloc_buffer((tile_z, d_qk), dtype, scope="shared")
+                            V_smem = T.sblock_alloc_buffer((tile_z, d_v), dtype, scope="shared")
+                            S_smem = T.sblock_alloc_buffer((tile_x, tile_z), "float32", scope="shared")
 
-                            S_local = T.alloc_buffer((tile_x, tile_z), "float32", scope="local")
-                            O_local = T.alloc_buffer((tile_x, d_v), "float32", scope="local")
+                            S_local = T.sblock_alloc_buffer((tile_x, tile_z), "float32", scope="local")
+                            O_local = T.sblock_alloc_buffer((tile_x, d_v), "float32", scope="local")
 
-                            m_smem = T.alloc_buffer((tile_x, ), "float32", scope="shared")
-                            m_prev_smem = T.alloc_buffer((tile_x, ), "float32", scope="shared")
-                            d_smem = T.alloc_buffer((tile_x, ), "float32", scope="shared")
+                            m_smem = T.sblock_alloc_buffer((tile_x, ), "float32", scope="shared")
+                            m_prev_smem = T.sblock_alloc_buffer((tile_x, ), "float32", scope="shared")
+                            d_smem = T.sblock_alloc_buffer((tile_x, ), "float32", scope="shared")
 
-                            m_new = T.alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
-                            m_prev = T.alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
-                            d_new = T.alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
+                            m_new = T.sblock_alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
+                            m_prev = T.sblock_alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
+                            d_new = T.sblock_alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
 
                             ## get tile_no, batch_idx, batch_tiles, batch_rows
                             tile_id[0] = bx
@@ -2529,14 +2550,14 @@ def _attention_prefill_ragged(
                                             d_smem[row] = 1.0
 
                                     for li, lj in T.grid(tile_x, d_v):
-                                        with T.block("O_init"):
+                                        with T.sblock("O_init"):
                                             i, j = T.axis.remap("SS", [li, lj])
                                             O_local[i, j] = 0.0
                                     T.tvm_storage_sync("shared")
 
                                     # Load Q from gmem to smem
                                     for li, lj in T.grid(tile_x, tile_y):
-                                        with T.block("Q_load"):
+                                        with T.sblock("Q_load"):
                                             i, j = T.axis.remap("SS", [li, lj])
                                             T.reads()
                                             T.writes()
@@ -2556,7 +2577,7 @@ def _attention_prefill_ragged(
                                         L_kv_start: T.int32 = iterator * tile_z
                                         L_kv_base: T.int32 = kv_indptr[b_idx]
                                         for lz, ly in T.grid(tile_z, tile_y):
-                                            with T.block("K_load"):
+                                            with T.sblock("K_load"):
                                                 i, j = T.axis.remap("SS", [lz, ly])
                                                 cur_L = L_kv_start + i
                                                 if cur_L < kv_chunk_len[0]:
@@ -2569,7 +2590,7 @@ def _attention_prefill_ragged(
                                                     K_smem[i, j] = 0.0
                                         T.tvm_storage_sync("shared")
                                         for lz, ly in T.grid(tile_z, d_v):
-                                            with T.block("V_load"):
+                                            with T.sblock("V_load"):
                                                 i, j = T.axis.remap("SS", [lz, ly])
                                                 T.reads()
                                                 T.writes()
@@ -2581,16 +2602,16 @@ def _attention_prefill_ragged(
                                         T.tvm_storage_sync("shared")
 
                                         # Compute S
-                                        with T.block():
+                                        with T.sblock():
                                             for li, lj, lk in T.grid(tile_x, tile_z, tile_y):
-                                                with T.block("S_gemm"):
+                                                with T.sblock("S_gemm"):
                                                     i, j, k = T.axis.remap("SSR", [li, lj, lk])
                                                     with T.init():
                                                         S_local[i, j] = 0.0
                                                     S_local[i, j] += T.cast(Q_smem[i, k], "float32") * T.cast(K_smem[j, k], "float32") * sm_scale * math.log2(math.exp(1))
                                         T.tvm_storage_sync("shared")
                                         for li, lj in T.grid(tile_x, tile_z):
-                                            with T.block("S_store"):
+                                            with T.sblock("S_store"):
                                                 i, j = T.axis.remap("SS", [li, lj])
                                                 S_smem[i, j] = S_local[i, j]
                                         T.tvm_storage_sync("shared")
@@ -2599,7 +2620,7 @@ def _attention_prefill_ragged(
                                         for i in T.serial(T.ceildiv(tile_x, bdx * num_warps)):
                                             row: T.int32 = i * bdx * num_warps + ty * bdx + tx
                                             if row < tile_x:
-                                                with T.block("update1"):
+                                                with T.sblock("update1"):
                                                     m_prev[i] = m_smem[row]
                                                     m_new[i] = m_smem[row]
                                                     # mask out of kv_chunk_len S
@@ -2615,7 +2636,7 @@ def _attention_prefill_ragged(
 
                                         for i in T.serial(T.ceildiv(tile_x, bdx * num_warps)):
                                             row: T.int32 = i * bdx * num_warps + ty * bdx + tx
-                                            with T.block("update"):
+                                            with T.sblock("update"):
                                                 for j in T.serial(tile_z):
                                                     # this is to avoid sync inside condition branch
                                                     if row < tile_x:
@@ -2632,7 +2653,7 @@ def _attention_prefill_ragged(
                                         for i in T.serial(T.ceildiv(tile_x, bdx * num_warps)):
                                             row: T.int32 = i * bdx * num_warps + ty * bdx + tx
                                             if row < tile_x:
-                                                with T.block("update"):
+                                                with T.sblock("update"):
                                                     for j in T.serial(tile_z):
                                                         d_new[i] += S_smem[row, j]
                                                     m_smem[row] = m_new[i]
@@ -2641,9 +2662,9 @@ def _attention_prefill_ragged(
                                         T.tvm_storage_sync("shared")
 
                                         # Update O
-                                        with T.block():
+                                        with T.sblock():
                                             for li, lj, lk in T.grid(tile_x, d_v, tile_z):
-                                                with T.block("O_gemm"):
+                                                with T.sblock("O_gemm"):
                                                     i, j, k = T.axis.remap("SSR", [li, lj, lk])
                                                     with T.init():
                                                         O_local[i, j] *= T.exp2(m_prev_smem[i] - m_smem[i])
@@ -2651,7 +2672,7 @@ def _attention_prefill_ragged(
 
                                     # Store O from smem to gmem
                                     for li, lj in T.grid(tile_x, d_v):
-                                        with T.block("O_store"):
+                                        with T.sblock("O_store"):
                                             i, j = T.axis.remap("SS", [li, lj])
                                             cur_L: T.int32 = q_indptr[b_idx] + (LH_start + i) // group_size
                                             cur_H_qo: T.int32 = by * group_size + (LH_start + i) % group_size
@@ -2660,7 +2681,7 @@ def _attention_prefill_ragged(
 
                                     # Store LSE to gmem
                                     for li in T.grid(tile_x):
-                                        with T.block("lse_store"):
+                                        with T.sblock("lse_store"):
                                             i = T.axis.remap("S", [li])
                                             cur_L: T.int32 = q_indptr[b_idx] + (LH_start + i) // group_size
                                             cur_H_qo: T.int32 = by * group_size + (LH_start + i) % group_size
@@ -2671,9 +2692,9 @@ def _attention_prefill_ragged(
                                     tile_id[0] += NUM_BLKS
     # fmt: on
     # pylint: enable=line-too-long,too-many-branches
-    sch = tir.Schedule(batch_prefill_ragged_kv)
+    sch = tvm.s_tir.Schedule(batch_prefill_ragged_kv)
     sch = _schedule_prefill_kernel(sch, LOAD_VEC, bdx, num_warps, tile_x, d_v, tile_z, True, False)
-    return sch.mod["main"].with_attr("tir.is_scheduled", True)
+    return sch.mod["main"].with_attr("tirx.is_scheduled", True)
 
 
 def _attention_prefill_mla(
@@ -2748,7 +2769,7 @@ def _attention_prefill_mla(
         for lbx in T.thread_binding(NUM_BLKS, thread="blockIdx.x"):
             for lty in T.thread_binding(num_warps, thread="threadIdx.y"):
                 for ltx in T.thread_binding(bdx, thread="threadIdx.x"):
-                    with T.block("attn"):
+                    with T.sblock("attn"):
                         bx, ty, tx = T.axis.remap("SSS", [lbx, lty, ltx])
                         T.reads()
                         T.writes()
@@ -2759,20 +2780,20 @@ def _attention_prefill_mla(
                         iterator = _var("int32")
                         kv_chunk_len = _var("int32")
 
-                        Q_smem = T.alloc_buffer((tile_x, d_qk), dtype, scope="shared")
-                        KV_smem = T.alloc_buffer((tile_z, d_qk), dtype, scope="shared")
-                        S_smem = T.alloc_buffer((tile_x, tile_z), "float32", scope="shared")
+                        Q_smem = T.sblock_alloc_buffer((tile_x, d_qk), dtype, scope="shared")
+                        KV_smem = T.sblock_alloc_buffer((tile_z, d_qk), dtype, scope="shared")
+                        S_smem = T.sblock_alloc_buffer((tile_x, tile_z), "float32", scope="shared")
 
-                        S_local = T.alloc_buffer((tile_x, tile_z), "float32", scope="local")
-                        O_local = T.alloc_buffer((tile_x, d_latent), "float32", scope="local")
+                        S_local = T.sblock_alloc_buffer((tile_x, tile_z), "float32", scope="local")
+                        O_local = T.sblock_alloc_buffer((tile_x, d_latent), "float32", scope="local")
 
-                        m_smem = T.alloc_buffer((tile_x, ), "float32", scope="shared")
-                        m_prev_smem = T.alloc_buffer((tile_x, ), "float32", scope="shared")
-                        d_smem = T.alloc_buffer((tile_x, ), "float32", scope="shared")
+                        m_smem = T.sblock_alloc_buffer((tile_x, ), "float32", scope="shared")
+                        m_prev_smem = T.sblock_alloc_buffer((tile_x, ), "float32", scope="shared")
+                        d_smem = T.sblock_alloc_buffer((tile_x, ), "float32", scope="shared")
 
-                        m_new = T.alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
-                        m_prev = T.alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
-                        d_new = T.alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
+                        m_new = T.sblock_alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
+                        m_prev = T.sblock_alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
+                        d_new = T.sblock_alloc_buffer((math.ceil(tile_x / (bdx * num_warps)),), "float32", scope="local")
 
                         ## get tile_no, batch_idx, batch_tiles, batch_rows
                         tile_id[0] = bx
@@ -2811,14 +2832,14 @@ def _attention_prefill_mla(
                                         d_smem[row] = 1.0
 
                                 for li, lj in T.grid(tile_x, d_latent):
-                                    with T.block("O_init"):
+                                    with T.sblock("O_init"):
                                         i, j = T.axis.remap("SS", [li, lj])
                                         O_local[i, j] = 0.0
                                 T.tvm_storage_sync("shared")
 
                                 # Load Q from gmem to smem
                                 for li, lj in T.grid(tile_x, tile_y):
-                                    with T.block("Q_load"):
+                                    with T.sblock("Q_load"):
                                         i, j = T.axis.remap("SS", [li, lj])
                                         T.reads()
                                         T.writes()
@@ -2833,7 +2854,7 @@ def _attention_prefill_mla(
                                 for iterator in T.serial(T.ceildiv(kv_chunk_len[0], tile_z)):
                                     L_kv_start: T.int32 = iterator * tile_z
                                     for lz, ly in T.grid(tile_z, tile_y):
-                                        with T.block("KV_load"):
+                                        with T.sblock("KV_load"):
                                             i, j = T.axis.remap("SS", [lz, ly])
                                             T.reads()
                                             T.writes()
@@ -2848,16 +2869,16 @@ def _attention_prefill_mla(
                                     T.tvm_storage_sync("shared")
 
                                     # Compute S
-                                    with T.block():
+                                    with T.sblock():
                                         for li, lj, lk in T.grid(tile_x, tile_z, tile_y):
-                                            with T.block("S_gemm"):
+                                            with T.sblock("S_gemm"):
                                                 i, j, k = T.axis.remap("SSR", [li, lj, lk])
                                                 with T.init():
                                                     S_local[i, j] = 0.0
                                                 S_local[i, j] += T.cast(Q_smem[i, k], "float32") * T.cast(KV_smem[j, k], "float32") * sm_scale * math.log2(math.exp(1))
                                     T.tvm_storage_sync("shared")
                                     for li, lj in T.grid(tile_x, tile_z):
-                                        with T.block("S_store"):
+                                        with T.sblock("S_store"):
                                             i, j = T.axis.remap("SS", [li, lj])
                                             S_smem[i, j] = S_local[i, j]
                                     T.tvm_storage_sync("shared")
@@ -2866,7 +2887,7 @@ def _attention_prefill_mla(
                                     for i in T.serial(T.ceildiv(tile_x, bdx * num_warps)):
                                         row: T.int32 = i * bdx * num_warps + ty * bdx + tx
                                         if row < tile_x:
-                                            with T.block("update1"):
+                                            with T.sblock("update1"):
                                                 m_prev[i] = m_smem[row]
                                                 m_new[i] = m_smem[row]
                                                 # mask out of kv_chunk_len S
@@ -2882,7 +2903,7 @@ def _attention_prefill_mla(
 
                                     for i in T.serial(T.ceildiv(tile_x, bdx * num_warps)):
                                         row: T.int32 = i * bdx * num_warps + ty * bdx + tx
-                                        with T.block("update"):
+                                        with T.sblock("update"):
                                             for j in T.serial(tile_z):
                                                 # this is to avoid sync inside condition branch
                                                 if row < tile_x:
@@ -2899,7 +2920,7 @@ def _attention_prefill_mla(
                                     for i in T.serial(T.ceildiv(tile_x, bdx * num_warps)):
                                         row: T.int32 = i * bdx * num_warps + ty * bdx + tx
                                         if row < tile_x:
-                                            with T.block("update"):
+                                            with T.sblock("update"):
                                                 for j in T.serial(tile_z):
                                                     d_new[i] += S_smem[row, j]
                                                 m_smem[row] = m_new[i]
@@ -2908,9 +2929,9 @@ def _attention_prefill_mla(
                                     T.tvm_storage_sync("shared")
 
                                     # Update O
-                                    with T.block():
+                                    with T.sblock():
                                         for li, lj, lk in T.grid(tile_x, d_latent, tile_z):
-                                            with T.block("O_gemm"):
+                                            with T.sblock("O_gemm"):
                                                 i, j, k = T.axis.remap("SSR", [li, lj, lk])
                                                 with T.init():
                                                     O_local[i, j] *= T.exp2(m_prev_smem[i] - m_smem[i])
@@ -2918,7 +2939,7 @@ def _attention_prefill_mla(
 
                                 # Store O from smem to gmem
                                 for li, lj in T.grid(tile_x, d_latent):
-                                    with T.block("O_store"):
+                                    with T.sblock("O_store"):
                                         i, j = T.axis.remap("SS", [li, lj])
                                         cur_L: T.int32 = q_indptr[b_idx] + (LH_start + i) // group_size
                                         cur_H_qo: T.int32 = (LH_start + i) % group_size
@@ -2927,7 +2948,7 @@ def _attention_prefill_mla(
 
                                 # Store LSE to gmem
                                 for li in T.grid(tile_x):
-                                    with T.block("lse_store"):
+                                    with T.sblock("lse_store"):
                                         i = T.axis.remap("S", [li])
                                         cur_L: T.int32 = q_indptr[b_idx] + (LH_start + i) // group_size
                                         cur_H_qo: T.int32 = (LH_start + i) % group_size
@@ -2938,11 +2959,11 @@ def _attention_prefill_mla(
                                 tile_id[0] += NUM_BLKS
     # fmt: on
     # pylint: enable=line-too-long,too-many-branches
-    sch = tir.Schedule(batch_prefill_paged_kv_mla)
+    sch = tvm.s_tir.Schedule(batch_prefill_paged_kv_mla)
     sch = _schedule_prefill_kernel(
         sch, LOAD_VEC, bdx, num_warps, tile_x, d_latent, tile_z, False, True
     )
-    return sch.mod["main"].with_attr("tir.is_scheduled", True)
+    return sch.mod["main"].with_attr("tirx.is_scheduled", True)
 
 
 def _copy_single_page(num_heads, page_size, head_dim, dtype, target: Target):
@@ -2955,7 +2976,7 @@ def _copy_single_page(num_heads, page_size, head_dim, dtype, target: Target):
         tgt_page_id: T.int64,
         copy_length: T.int64,
     ):
-        T.func_attr({"tir.is_scheduled": True})
+        T.func_attr({"tirx.is_scheduled": True})
         num_pages = T.int32()
         pages_elem_offset = T.int64()
         pages = T.match_buffer(
@@ -2969,7 +2990,7 @@ def _copy_single_page(num_heads, page_size, head_dim, dtype, target: Target):
             (copy_length * num_heads * head_dim + tx - 1) // tx, thread="blockIdx.x"
         ):
             for t in T.thread_binding(tx, thread="threadIdx.x"):
-                with T.block("copy"):
+                with T.sblock("copy"):
                     T.where(b * tx + t < copy_length * num_heads * head_dim)
                     vh = T.axis.spatial(
                         num_heads,
@@ -3002,7 +3023,7 @@ def _copy_single_page_mla(page_size, head_dim, dtype, target: Target):
         tgt_page_id: T.int64,
         copy_length: T.int64,
     ):
-        T.func_attr({"tir.is_scheduled": True})
+        T.func_attr({"tirx.is_scheduled": True})
         num_pages = T.int32()
         pages_elem_offset = T.int64()
         pages = T.match_buffer(
@@ -3011,7 +3032,7 @@ def _copy_single_page_mla(page_size, head_dim, dtype, target: Target):
 
         for b in T.thread_binding((copy_length * head_dim + tx - 1) // tx, thread="blockIdx.x"):
             for t in T.thread_binding(tx, thread="threadIdx.x"):
-                with T.block("copy"):
+                with T.sblock("copy"):
                     T.where(b * tx + t < copy_length * head_dim)
                     vp = T.axis.spatial(copy_length, (b * tx + t) // head_dim)
                     vd = T.axis.spatial(head_dim, T.Cast("int32", (b * tx + t) % head_dim))
@@ -3030,13 +3051,13 @@ def _copy_single_page_cpu(num_heads, page_size, head_dim, dtype):
         tgt_page_id: T.int64,
         copy_length: T.int64,
     ):
-        T.func_attr({"tir.is_scheduled": True})
+        T.func_attr({"tirx.is_scheduled": True})
         num_pages = T.int32()
         pages = T.match_buffer(var_pages, (num_pages, 2, num_heads, page_size, head_dim), dtype)
 
         for b in T.serial((copy_length * num_heads * head_dim + tx - 1) // tx):
             for t in T.serial(tx):
-                with T.block("copy"):
+                with T.sblock("copy"):
                     T.where(b * tx + t < copy_length * num_heads * head_dim)
                     vh = T.axis.spatial(
                         num_heads,
@@ -3069,7 +3090,7 @@ def _compact_kv_copy(num_heads, head_dim, dtype, target: Target, page_size: int 
         var_copy_src_dst_pos: T.handle,
         batch_size: T.int32,
     ):
-        T.func_attr({"tir.is_scheduled": True})
+        T.func_attr({"tirx.is_scheduled": True})
         num_pages = T.int32()
         total_copy_length = T.int32()
         copy_length_indptr_elem_offset = T.int32()
@@ -3094,7 +3115,7 @@ def _compact_kv_copy(num_heads, head_dim, dtype, target: Target, page_size: int 
             elem_offset=copy_src_dst_pos_elem_offset,
         )
 
-        with T.block("root"):
+        with T.sblock("root"):
             for bhd_o in T.thread_binding(
                 (batch_size * num_heads * head_dim + tx - 1) // tx, thread="blockIdx.x"
             ):
@@ -3126,7 +3147,7 @@ def _compact_kv_copy_cpu(num_heads, head_dim, dtype, page_size: int = 16):
         var_copy_src_dst_pos: T.handle,
         batch_size: T.int32,
     ):
-        T.func_attr({"tir.is_scheduled": True})
+        T.func_attr({"tirx.is_scheduled": True})
         num_pages = T.int32()
         total_copy_length = T.int32()
         copy_length_indptr_elem_offset = T.int32()
@@ -3145,7 +3166,7 @@ def _compact_kv_copy_cpu(num_heads, head_dim, dtype, page_size: int = 16):
             elem_offset=copy_src_dst_pos_elem_offset,
         )
 
-        with T.block("root"):
+        with T.sblock("root"):
             for bhd_o in T.serial((batch_size * num_heads * head_dim + tx - 1) // tx):
                 for bhd_i in T.serial(tx):
                     b: T.int32 = (bhd_o * tx + bhd_i) // (num_heads * head_dim)

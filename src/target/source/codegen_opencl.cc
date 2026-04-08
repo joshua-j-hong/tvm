@@ -181,7 +181,7 @@ std::string CodeGenOpenCL::Finish() {
 }
 
 void CodeGenOpenCL::BindThreadIndex(const IterVar& iv) {
-  ICHECK(!var_idmap_.count(iv->var.get()));
+  TVM_FFI_ICHECK(!var_idmap_.count(iv->var.get()));
   runtime::ThreadScope ts = runtime::ThreadScope::Create(iv->thread_tag);
   std::ostringstream os;
   if (ts.rank == 1) {
@@ -195,7 +195,7 @@ void CodeGenOpenCL::BindThreadIndex(const IterVar& iv) {
 void CodeGenOpenCL::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
   int lanes = t.lanes();
   if (t.is_handle()) {
-    ICHECK_EQ(lanes, 1) << "do not yet support vector types";
+    TVM_FFI_ICHECK_EQ(lanes, 1) << "do not yet support vector types";
     os << "void*";
     return;
   }
@@ -266,7 +266,7 @@ void CodeGenOpenCL::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
       return;
     }
   }
-  LOG(FATAL) << "Cannot convert type " << t << " to OpenCL type";
+  TVM_FFI_THROW(InternalError) << "Cannot convert type " << t << " to OpenCL type";
 }
 
 void CodeGenOpenCL::PrintType(const Type& type, std::ostream& os) {  // NOLINT(*)
@@ -282,7 +282,7 @@ void CodeGenOpenCL::PrintType(const Type& type, std::ostream& os) {  // NOLINT(*
   } else if (IsVoidType(type)) {
     os << "void";
   } else {
-    LOG(FATAL) << "Type " << type << " does not have a corresponding C Type";
+    TVM_FFI_THROW(InternalError) << "Type " << type << " does not have a corresponding C Type";
   }
 }
 
@@ -319,7 +319,7 @@ void CodeGenOpenCL::PrintVecStore(const BufferNode* buffer, DataType t, PrimExpr
 
 void CodeGenOpenCL::PrintVecElemLoadExpr(DataType t, int i, const std::string& value,
                                          std::ostream& os) {  // NOLINT(*)
-  ICHECK_GT(t.lanes(), 1);
+  TVM_FFI_ICHECK_GT(t.lanes(), 1);
   if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
     if (i != 0) {
       os << "|";
@@ -351,7 +351,7 @@ void CodeGenOpenCL::PrintStorageSync(const CallNode* op) {
     this->PrintIndent();
     this->stream << "barrier(CLK_LOCAL_MEM_FENCE);\n";
   } else if (sync == "global") {
-    LOG(FATAL) << "not supported";
+    TVM_FFI_THROW(InternalError) << "not supported";
   }
 }
 
@@ -398,8 +398,15 @@ std::string CodeGenOpenCL::CastTo(std::string value, DataType target) {
   }
 }
 
-void CodeGenOpenCL::VisitStmt_(const AllocateNode* op) {
-  allocation_size_.insert({op->buffer_var.get(), op->ConstantAllocationSize() * op->dtype.lanes()});
+void CodeGenOpenCL::VisitStmt_(const AllocBufferNode* op) {
+  // Compute constant_size from buffer shape
+  size_t constant_size = 1;
+  for (const auto& dim : op->buffer->shape) {
+    const IntImmNode* dim_imm = dim.as<IntImmNode>();
+    TVM_FFI_ICHECK(dim_imm) << "Can only handle constant size stack allocation for now";
+    constant_size *= dim_imm->value;
+  }
+  allocation_size_.insert({op->buffer->data.get(), constant_size * op->buffer->dtype.lanes()});
   CodeGenC::VisitStmt_(op);
 }
 
@@ -407,8 +414,9 @@ void CodeGenOpenCL::VisitExpr_(const CallNode* op, std::ostream& os) {
   if (op->op.same_as(builtin::address_of())) {
     // Overload tvm_address_of to add storage scope (e.g. __global).
     const BufferLoadNode* load = op->args[0].as<BufferLoadNode>();
-    ICHECK(op->args.size() == 1 && load);
-    ICHECK_EQ(load->indices.size(), 1) << "CodeGenOpenCL only supports flat memory allocations.";
+    TVM_FFI_ICHECK(op->args.size() == 1 && load);
+    TVM_FFI_ICHECK_EQ(load->indices.size(), 1)
+        << "CodeGenOpenCL only supports flat memory allocations.";
     os << "((";
     auto it = alloc_storage_scope_.find(load->buffer->data.get());
     if (it != alloc_storage_scope_.end()) {
@@ -420,11 +428,11 @@ void CodeGenOpenCL::VisitExpr_(const CallNode* op, std::ostream& os) {
     os << ')';
   } else if (op->op.same_as(builtin::texture2d_store())) {
     auto* ptr_type = op->args[0].as<VarNode>()->type_annotation.as<PointerTypeNode>();
-    ICHECK(ptr_type != nullptr) << "Texture Var's must be of PointerType";
-    ICHECK(runtime::IsTextureStorage(std::string(ptr_type->storage_scope)))
+    TVM_FFI_ICHECK(ptr_type != nullptr) << "Texture Var's must be of PointerType";
+    TVM_FFI_ICHECK(runtime::IsTextureStorage(std::string(ptr_type->storage_scope)))
         << "builtin::texture2d_store() only supports storing to texture buffers";
     const int channel_size = Downcast<IntImm>(op->args[4])->value;
-    ICHECK(channel_size == 64 || channel_size == 128)
+    TVM_FFI_ICHECK(channel_size == 64 || channel_size == 128)
         << "Unsupported Channel Size: " << channel_size;
     DataType channel_type = runtime::GetChannelType(channel_size);
 
@@ -438,7 +446,7 @@ void CodeGenOpenCL::VisitExpr_(const CallNode* op, std::ostream& os) {
     } else if (channel_size == 128) {
       os << "write_imagef(";
     } else {
-      LOG(FATAL) << "Unsupported Channel Size: " << channel_size;
+      TVM_FFI_THROW(InternalError) << "Unsupported Channel Size: " << channel_size;
     }
     this->PrintExpr(op->args[0], os);
     os << ", ";
@@ -460,7 +468,7 @@ void CodeGenOpenCL::VisitExpr_(const CallNode* op, std::ostream& os) {
     std::stringstream ss;
     const int channel_size = Downcast<IntImm>(op->args[4])->value;
     const int data_lanes = channel_size / op->dtype.bits();
-    ICHECK(channel_size == 64 || channel_size == 128)
+    TVM_FFI_ICHECK(channel_size == 64 || channel_size == 128)
         << "Unsupported Channel Size: " << channel_size;
     ss << "as_";
     this->PrintType(op->dtype.with_lanes(data_lanes), ss);
@@ -470,7 +478,7 @@ void CodeGenOpenCL::VisitExpr_(const CallNode* op, std::ostream& os) {
     } else if (channel_size == 128) {
       ss << "READ_IMAGEF(";
     } else {
-      LOG(FATAL) << "Unsupported Channel Size: " << channel_size;
+      TVM_FFI_THROW(InternalError) << "Unsupported Channel Size: " << channel_size;
     }
     this->PrintExpr(op->args[0], ss);
     ss << ", ";
@@ -487,12 +495,13 @@ void CodeGenOpenCL::VisitExpr_(const CallNode* op, std::ostream& os) {
 
     std::string rhs = SSAGetID(ss.str(), op->dtype.with_lanes(data_lanes));
     if (auto ramp = op->args.back().as<RampNode>()) {
-      if (ramp->base.as<IntImmNode>() && *tir::as_const_int(ramp->base) == 0 &&
-          *tir::as_const_int(ramp->lanes) == data_lanes && *tir::as_const_int(ramp->stride) == 1) {
+      if (ramp->base.as<IntImmNode>() && *tirx::as_const_int(ramp->base) == 0 &&
+          *tirx::as_const_int(ramp->lanes) == data_lanes &&
+          *tirx::as_const_int(ramp->stride) == 1) {
         os << rhs;
-      } else if (*tir::as_const_int(ramp->stride) == 1) {
+      } else if (*tirx::as_const_int(ramp->stride) == 1) {
         os << "(*(";
-        this->PrintType(op->dtype.with_lanes(*tir::as_const_int(ramp->lanes)), os);
+        this->PrintType(op->dtype.with_lanes(*tirx::as_const_int(ramp->lanes)), os);
         os << "*)";
         os << "((";
         this->PrintType(op->dtype.with_lanes(1), os);
@@ -500,7 +509,7 @@ void CodeGenOpenCL::VisitExpr_(const CallNode* op, std::ostream& os) {
         this->PrintExpr(ramp->base, os);
         os << "))";
       } else {
-        LOG(FATAL) << "Unsupported Texture Load Args";
+        TVM_FFI_THROW(InternalError) << "Unsupported Texture Load Args";
       }
     } else {
       os << "((";
@@ -598,8 +607,8 @@ void CodeGenOpenCL::VisitExpr_(const ModNode* op, std::ostream& os) {  // NOLINT
   if (op->dtype.is_int() || op->dtype.is_uint()) {
     opstr = "%";
   } else {
-    ICHECK(op->dtype.is_float()) << "Expected floating point or integer dtype in Mod, but got "
-                                 << op->dtype;
+    TVM_FFI_ICHECK(op->dtype.is_float())
+        << "Expected floating point or integer dtype in Mod, but got " << op->dtype;
     opstr = "fmod";
   }
   if (op->dtype.lanes() == 1) {
@@ -685,10 +694,11 @@ ffi::Module BuildOpenCL(IRModule mod, Target target) {
 
   ffi::Map<GlobalVar, PrimFunc> functions;
   for (auto [gvar, base_func] : mod->functions) {
-    ICHECK(base_func->IsInstance<PrimFuncNode>()) << "CodeGenOpenCL: Can only take PrimFunc";
+    TVM_FFI_ICHECK(base_func->IsInstance<PrimFuncNode>())
+        << "CodeGenOpenCL: Can only take PrimFunc";
     auto prim_func = Downcast<PrimFunc>(base_func);
     auto calling_conv = prim_func->GetAttr<Integer>(tvm::attr::kCallingConv);
-    ICHECK(calling_conv == CallingConv::kDeviceKernelLaunch)
+    TVM_FFI_ICHECK(calling_conv == CallingConv::kDeviceKernelLaunch)
         << "CodeGenOpenCL: expect calling_conv equals CallingConv::kDeviceKernelLaunch";
     functions.Set(gvar, prim_func);
   }
@@ -719,9 +729,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 }
 
 ffi::String DeviceScopeCompatibilityFromTarget(Target target, ffi::String memory_scope) {
-  auto prototype_keys = target->GetKeys();
-  bool is_adreno =
-      std::find(prototype_keys.begin(), prototype_keys.end(), "adreno") != prototype_keys.end();
+  bool is_adreno = target->HasKey("adreno");
   if (is_adreno) {
     return ffi::String("global");
   }

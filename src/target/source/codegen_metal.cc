@@ -23,9 +23,10 @@
 #include "codegen_metal.h"
 
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/transform.h>
 
 #include <algorithm>
+#include <cmath>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -78,7 +79,7 @@ void CodeGenMetal::AddFunction(const GlobalVar& gvar, const PrimFunc& func) {
 
   // add to alloc buffer type.
   auto global_symbol = func->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);
-  ICHECK(global_symbol.has_value())
+  TVM_FFI_ICHECK(global_symbol.has_value())
       << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
 
   // Function header.
@@ -122,7 +123,7 @@ void CodeGenMetal::AddFunction(const GlobalVar& gvar, const PrimFunc& func) {
     decl_stream << "struct " << arg_buf_type << " {\n";
     for (size_t i = num_buffer; i < func->params.size(); ++i) {
       Var v = func->params[i];
-      ICHECK(!v.dtype().is_handle());
+      TVM_FFI_ICHECK(!v.dtype().is_handle());
       std::string vid = AllocVarID(v.get());
       std::ostringstream vref;
       if (v.dtype().bits() == 32) {
@@ -146,11 +147,11 @@ void CodeGenMetal::AddFunction(const GlobalVar& gvar, const PrimFunc& func) {
     decl_stream << "};\n\n";
   }
   // Setup the thread group info.
-  ICHECK_EQ(name_supply_->FreshName("threadIdx"), "threadIdx");
-  ICHECK_EQ(name_supply_->FreshName("blockIdx"), "blockIdx");
+  TVM_FFI_ICHECK_EQ(name_supply_->FreshName("threadIdx"), "threadIdx");
+  TVM_FFI_ICHECK_EQ(name_supply_->FreshName("blockIdx"), "blockIdx");
   int work_dim = 0;
   auto launch_params =
-      func->GetAttr<ffi::Array<ffi::String>>(tir::attr::kKernelLaunchParams).value();
+      func->GetAttr<ffi::Array<ffi::String>>(tirx::attr::kKernelLaunchParams).value();
   for (const auto& tag : launch_params) {
     if (tag != runtime::launch_param::kUseDynamicSharedMemoryTag) {
       runtime::ThreadScope scope = runtime::ThreadScope::Create(tag);
@@ -179,7 +180,7 @@ void CodeGenMetal::AddFunction(const GlobalVar& gvar, const PrimFunc& func) {
 }
 
 void CodeGenMetal::BindThreadIndex(const IterVar& iv) {
-  ICHECK(!var_idmap_.count(iv->var.get()));
+  TVM_FFI_ICHECK(!var_idmap_.count(iv->var.get()));
   // if we only have threadIdx.x
   // metal will directly print as threadIdx
   std::string vname = iv->thread_tag;
@@ -193,7 +194,7 @@ void CodeGenMetal::BindThreadIndex(const IterVar& iv) {
 void CodeGenMetal::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
   int lanes = t.lanes();
   if (t.is_handle()) {
-    ICHECK_EQ(lanes, 1) << "do not yet support vector types";
+    TVM_FFI_ICHECK_EQ(lanes, 1) << "do not yet support vector types";
     os << "void*";
     return;
   }
@@ -208,7 +209,7 @@ void CodeGenMetal::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
   }
   bool fail = false;
   if (t.is_float()) {
-    // Need to care about sizes and alignment of half3/float3 because tir representation might not
+    // Need to care about sizes and alignment of half3/float3 because tirx representation might not
     // be aware of Metal half3/float3 details and can treat them as just three elements,
     // while sizes and alignmnents of half3/float3 are one element more (half3-8 bytes/
     // float13 - 16bytes).
@@ -268,7 +269,7 @@ void CodeGenMetal::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
     os << "bfloat";
     return;
   }
-  LOG(FATAL) << "Cannot convert type " << t << " to Metal type";
+  TVM_FFI_THROW(InternalError) << "Cannot convert type " << t << " to Metal type";
 }
 
 void CodeGenMetal::PrintStorageSync(const CallNode* op) {
@@ -280,7 +281,7 @@ void CodeGenMetal::PrintStorageSync(const CallNode* op) {
     this->PrintIndent();
     this->stream << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   } else if (sync == "global") {
-    LOG(FATAL) << "global barrier not supported";
+    TVM_FFI_THROW(InternalError) << "global barrier not supported";
   }
 }
 
@@ -304,40 +305,49 @@ void CodeGenMetal::PrintStorageScope(const std::string& scope, std::ostream& os)
   } else if (scope == "local") {
     os << "thread ";
   } else {
-    LOG(FATAL) << "Unknown storage scope `" << scope << "`";
+    TVM_FFI_THROW(InternalError) << "Unknown storage scope `" << scope << "`";
   }
 }
 
-void CodeGenMetal::VisitStmt_(const AllocateNode* op) {
-  ICHECK(!is_zero(op->condition));
-  std::string vid = AllocVarID(op->buffer_var.get());
+void CodeGenMetal::VisitStmt_(const AllocBufferNode* op) {
+  TVM_FFI_ICHECK(op->buffer.defined());
+  std::string vid = AllocVarID(op->buffer->data.get());
 
   this->PrintIndent();
-  size_t constant_size = op->ConstantAllocationSize();
-  ICHECK_GT(constant_size, 0) << "Can only handle constant size stack allocation for now";
+  // Compute constant_size from buffer shape
+  size_t constant_size = 1;
+  for (const auto& dim : op->buffer->shape) {
+    const IntImmNode* dim_imm = dim.as<IntImmNode>();
+    TVM_FFI_ICHECK(dim_imm) << "Can only handle constant size stack allocation for now";
+    constant_size *= dim_imm->value;
+  }
+  TVM_FFI_ICHECK_GT(constant_size, 0) << "Can only handle constant size stack allocation for now";
 
-  auto scope = GetPtrStorageScope(op->buffer_var);
-  alloc_storage_scope_[op->buffer_var.get()] = scope;
+  auto scope = GetPtrStorageScope(op->buffer->data);
+  alloc_storage_scope_[op->buffer->data.get()] = scope;
+  DataType dtype = op->buffer->dtype;
   if (scope == "metal.simdgroup") {
-    ICHECK(op->dtype == DataType::Float(16) || op->dtype == DataType::Float(32) ||
-           op->dtype == DataType::BFloat(16))
-        << "Only float16, float32, and bfloat16 are supported, but got " << op->dtype;
-    ICHECK(constant_size % 64 == 0)
+    TVM_FFI_ICHECK(dtype == DataType::Float(16) || dtype == DataType::Float(32) ||
+                   dtype == DataType::BFloat(16))
+        << "Only float16, float32, and bfloat16 are supported, but got " << dtype;
+    TVM_FFI_ICHECK(constant_size % 64 == 0)
         << "Only 8x8 matrix is supported, but got " << constant_size << " bytes\n";
 
     std::ostringstream dtype_os;
-    PrintType(op->dtype, dtype_os);
+    PrintType(dtype, dtype_os);
     std::string dtype_str = dtype_os.str();
-    simdgroup_dtype_[op->buffer_var.get()] = dtype_str;
+    simdgroup_dtype_[op->buffer->data.get()] = dtype_str;
     stream << "simdgroup_" << dtype_str << "8x8 " << vid << '[' << constant_size / 64 << "];\n";
   } else {
     PrintStorageScope(scope, stream);
-    PrintType(op->dtype, stream);
+    PrintType(dtype, stream);
     stream << ' ' << vid << '[' << constant_size << "];\n";
   }
 
-  RegisterHandleType(op->buffer_var.get(), op->dtype);
-  this->PrintStmt(op->body);
+  RegisterHandleType(op->buffer->data.get(), dtype);
+  if (op->annotations.count(tirx::attr::kVolatile)) {
+    MarkVolatile(op->buffer->data.get());
+  }
 }
 
 void CodeGenMetal::VisitExpr_(const SelectNode* op, std::ostream& os) {  // NOLINT(*)
@@ -358,23 +368,23 @@ void CodeGenMetal::VisitExpr_(const BroadcastNode* op, std::ostream& os) {  // N
 }
 
 void CodeGenMetal::VisitExpr_(const CallNode* op, std::ostream& os) {  // NOLINT(*)
-  CHECK(!op->op.as<GlobalVarNode>())
+  TVM_FFI_ICHECK(!op->op.as<GlobalVarNode>())
       << "CodegenMetal does not support inter-function calls, "
       << "but expression " << ffi::GetRef<Call>(op) << " calls PrimFunc " << op->op;
   auto f_check_simdgroup_shape = [](PrimExpr col, PrimExpr row) {
-    ICHECK(col->IsInstance<IntImmNode>() && row->IsInstance<IntImmNode>())
+    TVM_FFI_ICHECK(col->IsInstance<IntImmNode>() && row->IsInstance<IntImmNode>())
         << "Only constant shape is supported for simdgroup matrix, but got " << col << "x" << row;
     int col_val = col.as<IntImmNode>()->value;
     int row_val = row.as<IntImmNode>()->value;
-    ICHECK(col_val == 8 && row_val == 8)
+    TVM_FFI_ICHECK(col_val == 8 && row_val == 8)
         << "Only 8x8 matrix is supported, but got " << col_val << "x" << row_val;
   };
   if (op->op.same_as(builtin::make_filled_simdgroup_matrix())) {
-    ICHECK_EQ(op->args.size(), 5);
+    TVM_FFI_ICHECK_EQ(op->args.size(), 5);
     Var var = Downcast<Var>(op->args[0]);
     // Get the data type of the simdgroup matrix
     auto it = simdgroup_dtype_.find(var.get());
-    ICHECK(it != simdgroup_dtype_.end())
+    TVM_FFI_ICHECK(it != simdgroup_dtype_.end())
         << "Cannot find variable allocation for simdgroup: " << var;
     const std::string& dtype_str = it->second;
     f_check_simdgroup_shape(op->args[3], op->args[4]);
@@ -382,19 +392,19 @@ void CodeGenMetal::VisitExpr_(const CallNode* op, std::ostream& os) {  // NOLINT
        << dtype_str << ", " << PrintExpr(op->args[3]) << ", " << PrintExpr(op->args[4]) << ">("
        << PrintExpr(op->args[2]) << ")";
   } else if (op->op.same_as(builtin::simdgroup_load())) {
-    ICHECK_EQ(op->args.size(), 7);
+    TVM_FFI_ICHECK_EQ(op->args.size(), 7);
     f_check_simdgroup_shape(op->args[4], op->args[5]);
     os << "simdgroup_load(" << PrintExpr(op->args[0]) << "[" << PrintExpr(op->args[1]) << "], "
        << PrintExpr(op->args[2]) << ", " << PrintExpr(op->args[3]) << ", 0, "
        << PrintExpr(op->args[6]) << ")";
   } else if (op->op.same_as(builtin::simdgroup_store())) {
-    ICHECK_EQ(op->args.size(), 7);
+    TVM_FFI_ICHECK_EQ(op->args.size(), 7);
     f_check_simdgroup_shape(op->args[4], op->args[5]);
     os << "simdgroup_store(" << PrintExpr(op->args[0]) << "[" << PrintExpr(op->args[1]) << "], "
        << PrintExpr(op->args[2]) << ", " << PrintExpr(op->args[3]) << ", 0, "
        << PrintExpr(op->args[6]) << ")";
   } else if (op->op.same_as(builtin::simdgroup_multiply_accumulate())) {
-    ICHECK_EQ(op->args.size(), 8);
+    TVM_FFI_ICHECK_EQ(op->args.size(), 8);
     os << "simdgroup_multiply_accumulate("                                  //
        << PrintExpr(op->args[0]) << "[" << PrintExpr(op->args[1]) << "], "  //
        << PrintExpr(op->args[2]) << "[" << PrintExpr(op->args[3]) << "], "  //
@@ -434,7 +444,7 @@ void CodeGenMetal::VisitExpr_(const FloatImmNode* op, std::ostream& os) {  // NO
 
 ffi::Module BuildMetal(IRModule mod, Target target) {
   bool output_ssa = false;
-  mod = tir::transform::PointerValueTypeRewrite()(std::move(mod));
+  mod = tirx::transform::PointerValueTypeRewrite()(std::move(mod));
 
   std::ostringstream source_maker;
   std::unordered_map<std::string, std::string> smap;
@@ -442,9 +452,9 @@ ffi::Module BuildMetal(IRModule mod, Target target) {
   std::string fmt = fmetal_compile ? "metallib" : "metal";
 
   for (auto kv : mod->functions) {
-    ICHECK(kv.second->IsInstance<PrimFuncNode>()) << "CodeGenMetal: Can only take PrimFunc";
+    TVM_FFI_ICHECK(kv.second->IsInstance<PrimFuncNode>()) << "CodeGenMetal: Can only take PrimFunc";
     auto global_symbol = kv.second->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);
-    ICHECK(global_symbol.has_value());
+    TVM_FFI_ICHECK(global_symbol.has_value());
     std::string func_name = global_symbol.value();
 
     source_maker << "// Function: " << func_name << "\n";
@@ -452,7 +462,7 @@ ffi::Module BuildMetal(IRModule mod, Target target) {
     cg.Init(output_ssa);
     auto f = Downcast<PrimFunc>(kv.second);
     auto calling_conv = f->GetAttr<Integer>(tvm::attr::kCallingConv);
-    ICHECK(calling_conv == CallingConv::kDeviceKernelLaunch)
+    TVM_FFI_ICHECK(calling_conv == CallingConv::kDeviceKernelLaunch)
         << "CodeGenMetal: expect calling_conv equals CallingConv::kDeviceKernelLaunch";
 
     cg.AddFunction(kv.first, f);

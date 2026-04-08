@@ -15,15 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 # pylint: disable=invalid-name, redefined-builtin, no-else-return, consider-using-dict-items
+# ruff: noqa: RUF005
 """The Relax virtual machine."""
+
+from collections.abc import Callable
 from enum import IntEnum
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-from numbers import Number, Integral
+from numbers import Integral, Number
+from typing import Any
 
 import numpy as np  # type: ignore
+from tvm_ffi import register_global_func
 
 import tvm
-from tvm_ffi import register_global_func
 from tvm.runtime import Device, Object, PackedFunc
 from tvm.runtime.profiling import Report
 
@@ -36,7 +39,7 @@ class VMInstrumentReturnKind(IntEnum):
     SKIP_RUN = 1
 
 
-class VirtualMachine(object):
+class VirtualMachine:
     """Relax VM runtime."""
 
     NAIVE_ALLOCATOR = 1
@@ -44,9 +47,9 @@ class VirtualMachine(object):
 
     def __init__(
         self,
-        rt_mod: Union[tvm.runtime.Module, tvm.runtime.Executable],
-        device: Union[Device, List[Device]],
-        memory_cfg: Optional[Union[str, Dict[Device, str]]] = None,
+        rt_mod: tvm.runtime.Module | tvm.runtime.Executable,
+        device: Device | list[Device],
+        memory_cfg: str | dict[Device, str] | None = None,
         profile: bool = False,
     ) -> None:
         """
@@ -90,10 +93,10 @@ class VirtualMachine(object):
         self._set_instrument = self.module["set_instrument"]
         self._setup_device(device, memory_cfg)
 
-    def _setup_device(self, dev: Device, memory_cfg: Union[str, Dict[Device, str]]) -> None:
+    def _setup_device(self, dev: Device, memory_cfg: str | dict[Device, str]) -> None:
         """init devices and allocators."""
         devs = dev
-        if not isinstance(dev, (list, tuple)):
+        if not isinstance(dev, list | tuple):
             if not isinstance(dev, tvm.runtime.Device):
                 raise TypeError("dev is expected to be Device or List[Device]")
             devs = [dev]
@@ -113,7 +116,7 @@ class VirtualMachine(object):
         elif not isinstance(memory_cfg, dict):
             raise TypeError(
                 "memory_cfg is expected be string or dictionary, "
-                + "but received {}".format(type(memory_cfg))
+                + f"but received {type(memory_cfg)}"
             )
         init_args = []
         for device in devs:
@@ -148,9 +151,9 @@ class VirtualMachine(object):
         self,
         func_name: str,
         saved_name: str,
-        *args: List[Any],
+        *args: list[Any],
         include_return: bool = True,
-        **kwargs: Dict[str, Any],
+        **kwargs: dict[str, Any],
     ) -> None:
         """
         Convenience function. Takes a function from the module and saves
@@ -185,20 +188,20 @@ class VirtualMachine(object):
         kwargs : Dict[str, Any]
             Any named arguments to package up with the function
         """
-        cargs: List[Any] = []
+        cargs: list[Any] = []
         if kwargs:
             args = self._convert_func_named_args(func_name, args, **kwargs)
         for arg in args:
             self._convert(arg, cargs)
         self._save_function(func_name, saved_name, int(include_return), *cargs)
 
-    def _convert(self, arg: Any, cargs: List) -> None:
+    def _convert(self, arg: Any, cargs: list) -> None:
         """helper function to convert arguments to vm function."""
 
         def _gettype(arg):
             if isinstance(arg, np.float16):
                 return "float16"
-            elif isinstance(arg, (Integral, bool)):
+            elif isinstance(arg, Integral | bool):
                 return "int32"
             else:
                 return "float32"
@@ -210,19 +213,19 @@ class VirtualMachine(object):
             cargs.append(nd_arr)
         elif isinstance(arg, tvm.runtime.Tensor):
             cargs.append(arg)
-        elif isinstance(arg, (tuple, list)):
-            field_args: List[Any] = []
+        elif isinstance(arg, tuple | list):
+            field_args: list[Any] = []
             for field in arg:
                 self._convert(field, field_args)
             cargs.append(tuple(field_args))
-        elif isinstance(arg, (Number, bool)):
+        elif isinstance(arg, Number | bool):
             dtype = _gettype(arg)
             value = tvm.runtime.tensor(np.array(arg, dtype=dtype), device=tvm.cpu(0))
             cargs.append(value)
         elif isinstance(arg, str):
             cargs.append(arg)
         else:
-            raise TypeError("Unsupported type: %s" % (type(arg)))
+            raise TypeError(f"Unsupported type: {type(arg)}")
 
     def _convert_func_named_args(self, func_name: str, args: Any, **kwargs: Any) -> Any:
         """
@@ -268,7 +271,7 @@ class VirtualMachine(object):
         kwargs: dict of str to tvm.runtime.Tensor or np.ndarray
             Named arguments to the function.
         """
-        cargs: List[Any] = []
+        cargs: list[Any] = []
 
         if kwargs:
             args = self._convert_func_named_args(func_name, args, **kwargs)
@@ -294,7 +297,7 @@ class VirtualMachine(object):
         """
         self._invoke_stateful(func_name)
 
-    def get_outputs(self, func_name: str) -> Union[tvm.Object, Tuple[Any]]:
+    def get_outputs(self, func_name: str) -> tvm.Object | tuple[Any]:
         """
         Get the value output by the function by the given name
         after a call of `invoke_stateful`.
@@ -490,7 +493,7 @@ class VirtualMachine(object):
         report: tvm.runtime.profiling.Report
             The formatted profiling result, showing per-op timing measurements.
         """
-        cargs: List[Any] = []
+        cargs: list[Any] = []
 
         for arg in args:
             self._convert(arg, cargs)

@@ -16,12 +16,9 @@
 # under the License.
 """IRModule that holds the functions and type definitions."""
 
-from __future__ import annotations
-
-from typing import Dict, Union
+import tvm_ffi
 
 import tvm
-import tvm_ffi
 from tvm.runtime import Scriptable
 from tvm.runtime.object import Object
 
@@ -124,10 +121,10 @@ class IRModule(Node, Scriptable):
         assert isinstance(var, _expr.GlobalVar)
         return _ffi_api.Module_Lookup(self, var)
 
-    def __delitem__(self, var: Union[str, _expr.GlobalVar]):
+    def __delitem__(self, var: str | _expr.GlobalVar):
         _ffi_api.Module_Remove(self, var)
 
-    def __contains__(self, var: Union[str, _expr.GlobalVar]) -> bool:
+    def __contains__(self, var: str | _expr.GlobalVar) -> bool:
         return _ffi_api.Module_Contains(self, var)
 
     def update(self, other):
@@ -201,7 +198,7 @@ class IRModule(Node, Scriptable):
 
     def replace_global_vars(
         self,
-        replacements: Dict[Union[str, _expr.GlobalVar], Union[str, _expr.GlobalVar]],
+        replacements: dict[str | _expr.GlobalVar, str | _expr.GlobalVar],
     ) -> "IRModule":
         """Replace GlobalVar instances within the module
 
@@ -297,7 +294,7 @@ class IRModule(Node, Scriptable):
 
         return _ffi_api.Module_WithoutAttr(self, attr_key)
 
-    def with_attrs(self, attr_map: Union[DictAttrs, Dict[str, Object]]) -> "IRModule":
+    def with_attrs(self, attr_map: DictAttrs | dict[str, Object]) -> "IRModule":
         """Copy the IRModule and add the given attribute map to it.
         Parameters
         ----------

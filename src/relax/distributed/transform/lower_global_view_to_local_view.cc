@@ -26,13 +26,15 @@
 #include <tvm/relax/distributed/axis_group_graph.h>
 #include <tvm/relax/distributed/transform.h>
 #include <tvm/relax/expr_functor.h>
-#include <tvm/tir/stmt_functor.h>
+#include <tvm/s_tir/transform.h>
+#include <tvm/tirx/stmt_functor.h>
 
-#include "../../../tir/schedule/transform.h"
+#include "../../../s_tir/schedule/transform.h"
 #include "utils.h"
 namespace tvm {
-namespace tir {
+namespace tirx {
 using namespace tvm::relax::distributed;
+using s_tir::ReplaceBuffer;
 
 class DistBufferReplacer : public StmtExprMutator {
  public:
@@ -64,19 +66,19 @@ class DistBufferReplacer : public StmtExprMutator {
     return load;
   }
 
-  Stmt VisitStmt_(const BlockNode* _block) final {
-    Block old_block = ffi::GetRef<Block>(_block);
-    Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(_block));
-    ObjectPtr<BlockNode> new_block = ffi::make_object<BlockNode>(*block.get());
+  Stmt VisitStmt_(const SBlockNode* _block) final {
+    SBlock old_block = ffi::GetRef<SBlock>(_block);
+    SBlock block = Downcast<SBlock>(StmtExprMutator::VisitStmt_(_block));
+    ObjectPtr<SBlockNode> new_block = ffi::make_object<SBlockNode>(*block.get());
     new_block->reads = ReplaceBuffer(new_block->reads, buffer_map_);
     new_block->writes = ReplaceBuffer(new_block->writes, buffer_map_);
-    return Block(new_block);
+    return SBlock(new_block);
   }
 
   ffi::Map<Buffer, Buffer> buffer_map_;
 };
 
-class DistBlockInfoCollector : public StmtExprVisitor {
+class DistSBlockInfoCollector : public StmtExprVisitor {
  private:
   void VisitStmt_(const BufferStoreNode* op) final {
     buffer_access_indices[op->buffer].push_back(op->indices);
@@ -88,10 +90,10 @@ class DistBlockInfoCollector : public StmtExprVisitor {
     StmtExprVisitor::VisitExpr_(op);
   }
 
-  void VisitStmt_(const BlockNode* op) final {
+  void VisitStmt_(const SBlockNode* op) final {
     for (const auto& iter_var : op->iter_vars) {
       if (iter_var->iter_type == kCommReduce) {
-        ICHECK(op->writes.size() == 1);
+        TVM_FFI_ICHECK(op->writes.size() == 1);
         reduce_buffer_ = op->writes[0]->buffer;
       }
     }
@@ -149,7 +151,7 @@ class DistributedBufferCompactor : StmtExprMutator {
  public:
   static std::tuple<PrimFunc, std::string> DistBufferCompact(
       const std::vector<ShardingSpec>& sharding_specs, PrimFunc prim_func) {
-    prim_func = RenewDefs(prim_func);
+    prim_func = s_tir::RenewDefs(prim_func);
     DistributedBufferCompactor compactor(sharding_specs, prim_func);
     ffi::Map<Var, Buffer> new_func_buffer_map;
     ffi::Map<Buffer, Buffer> replace_buffer_map;
@@ -201,8 +203,9 @@ class DistributedBufferCompactor : StmtExprMutator {
   }
 
   ffi::Array<IterVar> ShardIterVar(
-      Block block, const std::unordered_map<Buffer, ffi::Array<ffi::Array<PrimExpr>>, ObjectPtrHash,
-                                            ObjectPtrEqual>& buffer_access_indices) {
+      SBlock block,
+      const std::unordered_map<Buffer, ffi::Array<ffi::Array<PrimExpr>>, ObjectPtrHash,
+                               ObjectPtrEqual>& buffer_access_indices) {
     std::vector<Buffer> buffers;
     for (const auto& read : block->reads) {
       buffers.push_back(read->buffer);
@@ -226,7 +229,7 @@ class DistributedBufferCompactor : StmtExprMutator {
           int dim = pr.first;
           int shard = pr.second;
           Var var = GetShardingVarFromIndex(access_index[dim], iter_var_range, &analyzer);
-          ICHECK(!iter_var_shards_.count(var) || iter_var_shards_[var] == shard)
+          TVM_FFI_ICHECK(!iter_var_shards_.count(var) || iter_var_shards_[var] == shard)
               << "A loop cannot have different sharding";
           iter_var_shards_[var] = shard;
         }
@@ -239,9 +242,9 @@ class DistributedBufferCompactor : StmtExprMutator {
         int shard = iter_var_shards_[iter_var->var];
         if (shard > 1) {
           Range dom = iter_var->dom;
-          ICHECK(is_zero(dom->min));
+          TVM_FFI_ICHECK(is_zero(dom->min));
           arith::Analyzer analyzer;
-          ICHECK(analyzer.CanProve(floormod(dom->extent, shard) == 0));
+          TVM_FFI_ICHECK(analyzer.CanProve(floormod(dom->extent, shard) == 0));
           new_iter_vars.push_back(
               IterVar(Range::FromMinExtent(dom->min, floordiv(dom->extent, shard)), iter_var->var,
                       iter_var->iter_type, iter_var->thread_tag));
@@ -271,9 +274,9 @@ class DistributedBufferCompactor : StmtExprMutator {
     return Buffer(new_buffer);
   }
 
-  Stmt VisitStmt_(const BlockNode* op) final {
-    Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
-    DistBlockInfoCollector collector;
+  Stmt VisitStmt_(const SBlockNode* op) final {
+    SBlock block = Downcast<SBlock>(StmtExprMutator::VisitStmt_(op));
+    DistSBlockInfoCollector collector;
     collector(block);
     ffi::Array<IterVar> new_iter_vars = ShardIterVar(block, collector.buffer_access_indices);
     ffi::Array<Buffer> new_alloc_buffers;
@@ -289,12 +292,12 @@ class DistributedBufferCompactor : StmtExprMutator {
     // sharding on reduction axis
     for (const IterVar& iter_var : new_iter_vars) {
       if (iter_var->iter_type == kCommReduce && iter_var_shards_.count(iter_var->var)) {
-        ICHECK(add_allreduce_kind_ == "");
+        TVM_FFI_ICHECK(add_allreduce_kind_ == "");
         AddAllReduceBlock(collector.reduce_kind);
         break;
       }
     }
-    ObjectPtr<BlockNode> new_block = ffi::make_object<BlockNode>(*block.operator->());
+    ObjectPtr<SBlockNode> new_block = ffi::make_object<SBlockNode>(*block.operator->());
     new_block->iter_vars = new_iter_vars;
     new_block->alloc_buffers = new_alloc_buffers;
     if (new_block->name_hint == "root") {
@@ -303,13 +306,13 @@ class DistributedBufferCompactor : StmtExprMutator {
                                       allocated_buffer_under_root.end());
     }
     new_block->body = DistBufferReplacer::BufferReplace(block->body, buffer_map);
-    return Block(new_block);
+    return SBlock(new_block);
   }
 
   void AddAllReduceBlock(std::string reduce_kind) { add_allreduce_kind_ = reduce_kind; }
 
-  Stmt VisitStmt_(const BlockRealizeNode* op) final {
-    BlockRealize realize = Downcast<BlockRealize>(StmtExprMutator::VisitStmt_(op));
+  Stmt VisitStmt_(const SBlockRealizeNode* op) final {
+    SBlockRealize realize = Downcast<SBlockRealize>(StmtExprMutator::VisitStmt_(op));
 
     for (int i = 0; i < static_cast<int>(realize->iter_values.size()); i++) {
       PrimExpr iter_value = realize->iter_values[i];
@@ -317,7 +320,7 @@ class DistributedBufferCompactor : StmtExprMutator {
       if (!iter_var_shards_.count(iter_var->var)) {
         continue;
       }
-      ICHECK(iter_value.as<VarNode>());
+      TVM_FFI_ICHECK(iter_value.as<VarNode>());
       loop_var_shards_[Downcast<Var>(iter_value)] = iter_var_shards_[iter_var->var];
     }
     return realize;
@@ -329,7 +332,7 @@ class DistributedBufferCompactor : StmtExprMutator {
       int shard = loop_var_shards_[op->loop_var];
       if (shard > 1) {
         arith::Analyzer analyzer;
-        ICHECK(analyzer.CanProve(floormod(new_loop->extent, shard) == 0));
+        TVM_FFI_ICHECK(analyzer.CanProve(floormod(new_loop->extent, shard) == 0));
         new_loop.CopyOnWrite()->extent = floordiv(new_loop->extent, shard);
         return new_loop;
       }
@@ -346,7 +349,7 @@ class DistributedBufferCompactor : StmtExprMutator {
   std::string add_allreduce_kind_;
 };
 
-}  // namespace tir
+}  // namespace tirx
 }  // namespace tvm
 
 namespace tvm {
@@ -383,7 +386,8 @@ class LowerTIRToLocalView : public ExprMutator {
       }
       return ret;
     } else {
-      LOG(FATAL) << "The output of a call_tir should be a DTensorStructInfo or TupleStructInfo";
+      TVM_FFI_THROW(InternalError)
+          << "The output of a call_tir should be a DTensorStructInfo or TupleStructInfo";
     }
   }
 
@@ -397,7 +401,7 @@ class LowerTIRToLocalView : public ExprMutator {
     ffi::Array<Expr> args = Downcast<Tuple>(val->args[1])->fields;
     for (const auto& arg : args) {
       const auto* sinfo = GetStructInfoAs<DTensorStructInfoNode>(arg);
-      ICHECK(sinfo);
+      TVM_FFI_ICHECK(sinfo);
       sharding_specs.push_back(ShardingSpec(sinfo->device_mesh, sinfo->placement));
     }
     Var output_var = binding->var;
@@ -406,11 +410,11 @@ class LowerTIRToLocalView : public ExprMutator {
       sharding_specs.push_back(ShardingSpec(sinfo->device_mesh, sinfo->placement));
     }
     GlobalVar gvar = Downcast<GlobalVar>(val->args[0]);
-    tir::PrimFunc prim_func = MatchPrimFunc(builder_->GetContextIRModule(), gvar).value();
-    tir::PrimFunc new_prim_func;
+    tirx::PrimFunc prim_func = MatchPrimFunc(builder_->GetContextIRModule(), gvar).value();
+    tirx::PrimFunc new_prim_func;
     std::string allreduce_kind;
     std::tie(new_prim_func, allreduce_kind) =
-        tir::DistributedBufferCompactor::DistBufferCompact(sharding_specs, prim_func);
+        tirx::DistributedBufferCompactor::DistBufferCompact(sharding_specs, prim_func);
     auto new_gvar = builder_->AddFunction(new_prim_func, gvar->name_hint);
     Call call = Downcast<Call>(this->VisitExpr(binding->value));
     ObjectPtr<CallNode> new_call_node = ffi::make_object<CallNode>(*call.get());

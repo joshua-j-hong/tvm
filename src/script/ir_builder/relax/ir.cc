@@ -20,7 +20,7 @@
 #include <tvm/relax/analysis.h>
 #include <tvm/relax/struct_info.h>
 #include <tvm/script/ir_builder/relax/ir.h>
-#include <tvm/tir/op.h>
+#include <tvm/tirx/op.h>
 
 #include "./utils.h"
 
@@ -80,8 +80,8 @@ tvm::relax::Var Arg(const ffi::String& name, const tvm::relax::StructInfo& struc
 void FuncName(const ffi::String& name) {
   FunctionFrame frame = FindFunctionFrame("R.func_name");
   if (frame->name.has_value()) {
-    LOG(FATAL) << "ValueError: Duplicate function name, previous one is: \"" << frame->name.value()
-               << "\"";
+    TVM_FFI_THROW(ValueError) << "Duplicate function name, previous one is: \""
+                              << frame->name.value() << "\"";
   }
   frame->name = name;
 }
@@ -90,15 +90,15 @@ void FuncAttrs(ffi::Map<ffi::String, ffi::Any> attrs) {
   FunctionFrame frame = FindFunctionFrame("R.func_attr");
   for (const auto& [key, value] : attrs) {
     if (key == tvm::attr::kGlobalSymbol && frame->is_private.value_or(Bool(false))->value) {
-      LOG(FATAL) << "ValueError: "
-                 << "A private function may not have the kGlobalSymbol (\""
-                 << tvm::attr::kGlobalSymbol << "\") attribute.  "
-                 << "However, a private function specified the global symbol as " << value;
+      TVM_FFI_THROW(ValueError) << "A private function may not have the kGlobalSymbol (\""
+                                << tvm::attr::kGlobalSymbol << "\") attribute.  "
+                                << "However, a private function specified the global symbol as "
+                                << value;
     }
     if (auto prev = frame->attrs.Get(key)) {
-      LOG(FATAL) << "ValueError: "
-                 << "Duplicate R.func_attr annotation for key = \"" << key << "\".  "
-                 << "Previous value was " << prev.value() << ", with later definition as " << value;
+      TVM_FFI_THROW(ValueError) << "Duplicate R.func_attr annotation for key = \"" << key << "\".  "
+                                << "Previous value was " << prev.value()
+                                << ", with later definition as " << value;
     } else {
       frame->attrs.Set(key, value);
     }
@@ -108,8 +108,8 @@ void FuncAttrs(ffi::Map<ffi::String, ffi::Any> attrs) {
 void FuncRetStructInfo(const tvm::relax::StructInfo& ret_sinfo) {
   FunctionFrame frame = FindFunctionFrame("R.func_ret_struct_info");
   if (frame->ret_struct_info.defined()) {
-    LOG(FATAL) << "ValueError: Duplicate function return struct info, previous one is:\n "
-               << frame->ret_struct_info.value();
+    TVM_FFI_THROW(ValueError) << "Duplicate function return struct info, previous one is:\n "
+                              << frame->ret_struct_info.value();
   }
   frame->ret_struct_info = ret_sinfo;
 }
@@ -125,7 +125,7 @@ void FuncRetValue(const tvm::relax::Expr& value) {
   // a function body. Therefore if there is any unended block frame when dealing with function
   // return, we should end the block frame.
 
-  if (auto opt = ir_builder->GetLastFrame<BlockFrame>()) {
+  if (auto opt = ir_builder->GetLastFrame<BindingBlockFrame>()) {
     auto block_frame = opt.value();
     for (const auto& var : tvm::relax::FreeVars(normalized_value)) {
       if (var->IsInstance<tvm::relax::DataflowVarNode>()) {
@@ -135,8 +135,7 @@ void FuncRetValue(const tvm::relax::Expr& value) {
   }
   // Step 2. Add the output value to the function frame.
   FunctionFrame frame = FindFunctionFrame("return");
-  CHECK(!frame->output.defined())
-      << "ValueError: "
+  TVM_FFI_CHECK(!frame->output.defined(), ValueError)
       << "Relax functions do not support multiple return statement.  "
       << "However, return of " << normalized_value << " occurred after a return of "
       << frame->output << ".  "
@@ -159,28 +158,29 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 
 ///////////////////////////// BindingBlock //////////////////////////////
 
-BlockFrame Dataflow() {
-  ObjectPtr<BlockFrameNode> n = ffi::make_object<BlockFrameNode>();
+BindingBlockFrame Dataflow() {
+  ObjectPtr<BindingBlockFrameNode> n = ffi::make_object<BindingBlockFrameNode>();
   n->is_dataflow = true;
   n->block_ended = false;
-  return BlockFrame(n);
+  return BindingBlockFrame(n);
 }
 
-BlockFrame BindingBlock() {
-  ObjectPtr<BlockFrameNode> n = ffi::make_object<BlockFrameNode>();
+BindingBlockFrame BindingBlock() {
+  ObjectPtr<BindingBlockFrameNode> n = ffi::make_object<BindingBlockFrameNode>();
   n->is_dataflow = false;
   n->block_ended = false;
-  return BlockFrame(n);
+  return BindingBlockFrame(n);
 }
 
 void DataflowBlockOutput(const ffi::Array<tvm::relax::Var>& vars) {
   // Step 1. Check that we're in a Dataflow block that is not ended.
-  ffi::Optional<BlockFrame> block_frame = IRBuilder::Current()->GetLastFrame<BlockFrame>();
-  CHECK(block_frame.defined() && block_frame.value()->is_dataflow)
-      << "ValueError: `R.output` should appear inside a dataflow block. However, the current "
+  ffi::Optional<BindingBlockFrame> block_frame =
+      IRBuilder::Current()->GetLastFrame<BindingBlockFrame>();
+  TVM_FFI_CHECK(block_frame.defined() && block_frame.value()->is_dataflow, ValueError)
+      << "`R.output` should appear inside a dataflow block. However, the current "
          "innermost block is not a dataflow block.";
-  CHECK(!block_frame.value()->block_ended)
-      << "ValueError: It is not allowed for a dataflow block to have multiple output operation.";
+  TVM_FFI_CHECK(!block_frame.value()->block_ended, ValueError)
+      << "It is not allowed for a dataflow block to have multiple output operation.";
 
   // Step 2. Mark the block frame ended of construction, so that any followup binding after this
   // mark in the dataflow block will lead to an error.
@@ -190,8 +190,9 @@ void DataflowBlockOutput(const ffi::Array<tvm::relax::Var>& vars) {
   // block.
   const ffi::Array<tvm::relax::Var>& emitted_vars = block_frame.value()->emitted_vars;
   for (const tvm::relax::Var& var : vars) {
-    CHECK(std::find(emitted_vars.begin(), emitted_vars.end(), var) != emitted_vars.end())
-        << "ValueError: An output variable is not emitted by this dataflow block. Please make sure "
+    TVM_FFI_CHECK(std::find(emitted_vars.begin(), emitted_vars.end(), var) != emitted_vars.end(),
+                  ValueError)
+        << "An output variable is not emitted by this dataflow block. Please make sure "
            "all dataflow block output variables are emitted exactly by this block.";
     block_frame.value()->output_vars.push_back(var);
   }
@@ -210,14 +211,15 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 tvm::relax::Var Emit(const tvm::relax::Expr& expr,
                      const ffi::Optional<tvm::relax::StructInfo>& annotate_struct_info) {
   using tvm::relax::GetStructInfo;
-  BlockFrame block_frame = CheckBlockFrameExistAndUnended();
+  BindingBlockFrame block_frame = CheckBindingBlockFrameExistAndUnended();
   const tvm::relax::BlockBuilder& block_builder = GetBlockBuilder();
   if (annotate_struct_info.defined()) {
     const auto& sinfo = annotate_struct_info.value();
     if (!expr->struct_info_.defined()) {
       UpdateStructInfo(expr, sinfo);
     } else {
-      CHECK(StructInfoBaseCheck(sinfo, GetStructInfo(expr)) != tvm::relax::BaseCheckResult::kFailL0)
+      TVM_FFI_ICHECK(StructInfoBaseCheck(sinfo, GetStructInfo(expr)) !=
+                     tvm::relax::BaseCheckResult::kFailL0)
           << "Invalid annotation. Got rhs value struct info: " << GetStructInfo(expr)
           << ", given struct info: " << sinfo;
     }
@@ -229,7 +231,7 @@ tvm::relax::Var Emit(const tvm::relax::Expr& expr,
 
 tvm::relax::Var EmitMatchCast(const tvm::relax::Expr& value,
                               const tvm::relax::StructInfo& struct_info) {
-  BlockFrame block_frame = CheckBlockFrameExistAndUnended();
+  BindingBlockFrame block_frame = CheckBindingBlockFrameExistAndUnended();
   const tvm::relax::BlockBuilder& block_builder = GetBlockBuilder();
 
   tvm::relax::Var var = block_builder->EmitMatchCast(value, struct_info);
@@ -238,7 +240,7 @@ tvm::relax::Var EmitMatchCast(const tvm::relax::Expr& value,
 }
 
 tvm::relax::Var EmitVarBinding(const tvm::relax::VarBinding& binding) {
-  BlockFrame block_frame = CheckBlockFrameExistAndUnended();
+  BindingBlockFrame block_frame = CheckBindingBlockFrameExistAndUnended();
   const tvm::relax::BlockBuilder& block_builder = GetBlockBuilder();
   block_builder->EmitNormalized(binding);
   block_frame->emitted_vars.push_back(binding->var);

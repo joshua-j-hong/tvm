@@ -14,6 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# ruff: noqa: F401
 """This module defines a Session in Disco. Session is the primary interface that users interact
 with the distributed runtime.
 """
@@ -21,15 +22,16 @@ with the distributed runtime.
 import logging
 import os
 import pickle
-from typing import Any, Callable, Optional, Sequence, Union
+from collections.abc import Callable, Sequence
+from typing import Any, Optional, Union
 
 import numpy as np
-
 from tvm_ffi import get_global_func, register_global_func, register_object
-from ..device import Device
-from ..container import ShapeTuple
+
 from .._tensor import Tensor
 from .._tensor import tensor as _as_Tensor
+from ..container import ShapeTuple
+from ..device import Device
 from ..object import Object
 from . import _ffi_api, process_pool  # pylint: disable=unused-import
 
@@ -58,7 +60,7 @@ class DRef(Object):
     def debug_copy_from(
         self,
         worker_id: int,
-        value: Union[np.ndarray, Tensor],
+        value: np.ndarray | Tensor,
     ) -> None:
         """Copy an Tensor value to remote for debugging purposes.
 
@@ -118,7 +120,7 @@ class Session(Object):
         self,
         shape: Sequence[int],
         dtype: str,
-        device: Optional[Device] = None,
+        device: Device | None = None,
         worker0_only: bool = False,
         in_group: bool = True,
     ) -> DRef:
@@ -259,7 +261,7 @@ class Session(Object):
         """
         return _ffi_api.SessionCopyFromWorker0(self, host_array, remote_array)  # type: ignore # pylint: disable=no-member
 
-    def copy_to_worker_0(self, host_array: Tensor, remote_array: Optional[DRef] = None) -> DRef:
+    def copy_to_worker_0(self, host_array: Tensor, remote_array: DRef | None = None) -> DRef:
         """Copy the controller-side Tensor to worker-0.
 
         Parameters
@@ -289,7 +291,7 @@ class Session(Object):
     def load_vm_module(
         self,
         path: str,
-        device: Optional[Device] = None,
+        device: Device | None = None,
     ) -> DModule:
         """Load a VM module from a file.
 
@@ -329,8 +331,8 @@ class Session(Object):
 
     def broadcast(
         self,
-        src: Union[np.ndarray, Tensor],
-        dst: Optional[DRef] = None,
+        src: np.ndarray | Tensor,
+        dst: DRef | None = None,
         in_group: bool = True,
     ) -> DRef:
         """Broadcast an array to all workers
@@ -387,8 +389,8 @@ class Session(Object):
 
     def scatter(
         self,
-        src: Union[np.ndarray, Tensor],
-        dst: Optional[DRef] = None,
+        src: np.ndarray | Tensor,
+        dst: DRef | None = None,
         in_group: bool = True,
     ) -> DRef:
         """Scatter an array across all workers

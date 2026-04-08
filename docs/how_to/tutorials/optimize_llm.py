@@ -14,6 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# ruff: noqa: F401
 
 """
 .. _opt_llm:
@@ -54,21 +55,20 @@ TinyLlama model from Hugging Face and deploy it on various devices.
 # model architecture by ourselves. Apache TVM prepares a PyTorch-liked API to construct the model
 # architecture. We can use the API to construct the model architecture.
 
-
 import dataclasses
 import enum
 import os
 from pathlib import Path
 from pprint import pprint
-from typing import List, Optional
 
 import tvm
-from tvm import dlight, relax, te, tir
+from tvm import relax, te, tirx
 from tvm.relax import register_pipeline
 from tvm.relax.frontend import nn
 from tvm.relax.frontend.nn import Tensor, op
 from tvm.relax.frontend.nn.llm.kv_cache import PagedKVCache, TIRPagedKVCache
 from tvm.runtime import ShapeTuple
+from tvm.s_tir import dlight
 
 ######################################################################
 # First, we need to define the model configuration. The configuration includes the key parameters
@@ -237,7 +237,7 @@ class LlamaModel(nn.Module):
         return hidden_states
 
 
-class LlamaForCasualLM(nn.Module):
+class LlamaForCausalLM(nn.Module):
     def __init__(self, config: LlamaConfig):
         self.model = LlamaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -250,7 +250,7 @@ class LlamaForCasualLM(nn.Module):
         self.rope_theta = config.rope_theta
         self.dtype = "float32"
 
-    def to(self, dtype: Optional[str] = None):
+    def to(self, dtype: str | None = None):
         super().to(dtype=dtype)
         if dtype is not None:
             self.dtype = dtype
@@ -281,10 +281,10 @@ class LlamaForCasualLM(nn.Module):
 
     def create_tir_paged_kv_cache(
         self,
-        max_batch_size: tir.Var,
-        max_total_seq_len: tir.Var,
-        prefill_chunk_size: tir.Var,
-        page_size: tir.Var,
+        max_batch_size: tirx.Var,
+        max_total_seq_len: tirx.Var,
+        prefill_chunk_size: tirx.Var,
+        page_size: tirx.Var,
     ) -> PagedKVCache:
         return TIRPagedKVCache(
             attn_kind="mha",
@@ -358,7 +358,7 @@ class LlamaForCasualLM(nn.Module):
 # For demonstration, we only show the part of the model architecture. and parameters.
 
 model_config = LlamaConfig()
-model = LlamaForCasualLM(model_config)
+model = LlamaForCausalLM(model_config)
 model.to("float16")
 mod, named_params = model.export_tvm(spec=model.get_default_spec())
 prefill_str = mod["prefill"].script()
@@ -377,7 +377,7 @@ pprint(named_params[:5])  # Only show the first 5 parameters for demonstration
 
 @register_pipeline("opt_llm")
 def _pipeline(  # pylint: disable=too-many-arguments
-    ext_mods: List[nn.ExternModule] = None,
+    ext_mods: list[nn.ExternModule] | None = None,
 ):
     ext_mods = ext_mods or []
 

@@ -26,7 +26,7 @@
 
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/node/node.h>
+#include <tvm/runtime/object.h>
 
 #include <string>
 #include <utility>
@@ -83,7 +83,7 @@ class EnvFunc : public ObjectRef {
   template <typename... Args>
   ffi::Any operator()(Args&&... args) const {
     const EnvFuncNode* n = operator->();
-    ICHECK(n != nullptr);
+    TVM_FFI_ICHECK(n != nullptr);
     return n->func(std::forward<Args>(args)...);
   }
   /*!
@@ -141,7 +141,7 @@ class TypedEnvFunc<R(Args...)> : public ObjectRef {
    */
   R operator()(Args... args) const {
     const EnvFuncNode* n = operator->();
-    ICHECK(n != nullptr);
+    TVM_FFI_ICHECK(n != nullptr);
     if constexpr (std::is_same_v<R, void>) {
       n->func(std::forward<Args>(args)...);
     } else {

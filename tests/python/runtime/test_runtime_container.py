@@ -14,6 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# ruff: noqa: E712, F401
 
 import pickle
 import random
@@ -21,8 +22,8 @@ import random
 import numpy as np
 
 import tvm
-import tvm.testing
 import tvm.runtime
+import tvm.testing
 from tvm.runtime import container as _container
 
 
@@ -124,11 +125,11 @@ def test_conversion_of_arg():
     func = tvm.get_global_func("testing.AcceptsPrimExpr")
 
     res = func(1)
-    assert isinstance(res, tvm.tir.IntImm)
+    assert isinstance(res, tvm.tirx.IntImm)
     assert res.dtype == "int32"
 
     res = func(True)
-    assert isinstance(res, tvm.tir.IntImm)
+    assert isinstance(res, tvm.tirx.IntImm)
     assert res.dtype == "bool"
 
 
@@ -145,9 +146,9 @@ def test_conversion_of_array_elements():
     func = tvm.get_global_func("testing.AcceptsArrayOfPrimExpr")
 
     res = func([1, False])
-    assert isinstance(res[0], tvm.tir.IntImm)
+    assert isinstance(res[0], tvm.tirx.IntImm)
     assert res[0].dtype == "int32"
-    assert isinstance(res[1], tvm.tir.IntImm)
+    assert isinstance(res[1], tvm.tirx.IntImm)
     assert res[1].dtype == "bool"
 
 
@@ -164,9 +165,9 @@ def test_conversion_of_map_values():
     func = tvm.get_global_func("testing.AcceptsMapOfPrimExpr")
 
     res = func({"a": 1, "b": False})
-    assert isinstance(res["a"], tvm.tir.IntImm)
+    assert isinstance(res["a"], tvm.tirx.IntImm)
     assert res["a"].dtype == "int32"
-    assert isinstance(res["b"], tvm.tir.IntImm)
+    assert isinstance(res["b"], tvm.tirx.IntImm)
     assert res["b"].dtype == "bool"
 
 

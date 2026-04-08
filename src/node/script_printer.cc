@@ -19,6 +19,7 @@
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/expr.h>
+#include <tvm/node/cast.h>
 #include <tvm/node/repr_printer.h>
 #include <tvm/node/script_printer.h>
 
@@ -128,10 +129,10 @@ PrinterConfig::PrinterConfig(ffi::Map<ffi::String, Any> config_dict) {
   }
 
   // Checking prefixes if they are valid Python identifiers.
-  CHECK(IsIdentifier(n->ir_prefix)) << "Invalid `ir_prefix`: " << n->ir_prefix;
-  CHECK(IsIdentifier(n->tir_prefix)) << "Invalid `tir_prefix`: " << n->tir_prefix;
-  CHECK(IsIdentifier(n->relax_prefix)) << "Invalid `relax_prefix`: " << n->relax_prefix;
-  CHECK(n->module_alias.empty() || IsIdentifier(n->module_alias))
+  TVM_FFI_ICHECK(IsIdentifier(n->ir_prefix)) << "Invalid `ir_prefix`: " << n->ir_prefix;
+  TVM_FFI_ICHECK(IsIdentifier(n->tir_prefix)) << "Invalid `tir_prefix`: " << n->tir_prefix;
+  TVM_FFI_ICHECK(IsIdentifier(n->relax_prefix)) << "Invalid `relax_prefix`: " << n->relax_prefix;
+  TVM_FFI_ICHECK(n->module_alias.empty() || IsIdentifier(n->module_alias))
       << "Invalid `module_alias`: " << n->module_alias;
 
   this->data_ = std::move(n);

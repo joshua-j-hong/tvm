@@ -112,7 +112,7 @@ static_assert(static_cast<int>(TypeIndex::kCustomStaticIndex) >=
                 "Object types that are declared as final, "            \
                 "using the TVM_FFI_DECLARE_OBJECT_INFO_FINAL macro."); \
   ObjectName* CopyOnWrite() {                                          \
-    ICHECK(data_ != nullptr);                                          \
+    TVM_FFI_ICHECK(data_ != nullptr);                                  \
     if (!data_.unique()) {                                             \
       auto n = ::tvm::ffi::make_object<ObjectName>(*(operator->()));   \
       ObjectPtr<Object>(std::move(n)).swap(data_);                     \
@@ -139,7 +139,10 @@ static_assert(static_cast<int>(TypeIndex::kCustomStaticIndex) >=
 
 }  // namespace runtime
 
+using tvm::ffi::Object;
 using tvm::ffi::ObjectPtr;
+using tvm::ffi::ObjectPtrEqual;
+using tvm::ffi::ObjectPtrHash;
 using tvm::ffi::ObjectRef;
 }  // namespace tvm
 #endif  // TVM_RUNTIME_OBJECT_H_

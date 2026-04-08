@@ -45,19 +45,39 @@ Python API
     relax/relax
     relax/analysis
     relax/block_builder
+    relax/distributed
     relax/frontend
     relax/op
+    relax/training
     relax/transform
+    relax/dpl
 
 .. toctree::
     :maxdepth: 1
-    :caption: tvm.tir
+    :caption: tvm.tirx
 
-    tir/tir
-    tir/analysis
-    tir/schedule
-    tir/stmt_functor
-    tir/transform
+    tirx/tirx
+    tirx/analysis
+    tirx/stmt_functor
+    tirx/transform
+
+.. toctree::
+    :maxdepth: 1
+    :caption: tvm.s_tir
+
+    s_tir/analysis
+    s_tir/schedule
+    s_tir/transform
+    s_tir/dlight
+
+.. toctree::
+    :maxdepth: 1
+    :caption: tvm.script
+
+    script/script
+    script/parser
+    script/ir_builder
+    script/printer
 
 .. toctree::
     :maxdepth: 1
@@ -68,15 +88,11 @@ Python API
 
 .. toctree::
     :maxdepth: 1
-    :caption: tvm.meta_schedule
+    :caption: tvm.s_tir.meta_schedule
 
     meta_schedule
 
-.. toctree::
-    :maxdepth: 1
-    :caption: tvm.dlight
 
-    dlight
 
 .. toctree::
     :maxdepth: 1

@@ -26,7 +26,6 @@
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/node/attr_registry_map.h>
-#include <tvm/node/node.h>
 #include <tvm/target/target.h>
 
 #include <utility>
@@ -81,6 +80,13 @@ class TargetTag : public ObjectRef {
    * \return A dictionary that maps tag name to the concrete target it corresponds to
    */
   TVM_DLL static ffi::Map<ffi::String, Target> ListTags();
+  /*!
+   * \brief Retrieve the raw config dict for a target tag
+   * \param target_tag_name Name of the target tag
+   * \return The config dict if the tag exists, nullopt otherwise
+   */
+  TVM_DLL static ffi::Optional<ffi::Map<ffi::String, Any>> GetConfig(
+      const ffi::String& target_tag_name);
   /*!
    * \brief Add a tag into the registry
    * \param name Name of the tag
@@ -151,7 +157,7 @@ inline TargetTagRegEntry& TargetTagRegEntry::set_name() {
 }
 
 #define TVM_TARGET_TAG_REGISTER_VAR_DEF \
-  static DMLC_ATTRIBUTE_UNUSED ::tvm::TargetTagRegEntry& __make_##TargetTag
+  static TVM_ATTRIBUTE_UNUSED ::tvm::TargetTagRegEntry& __make_##TargetTag
 
 /*!
  * \def TVM_REGISTER_TARGET_TAG

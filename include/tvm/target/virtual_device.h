@@ -235,8 +235,8 @@ class VirtualDeviceNode : public AttrsNodeReflAdapter<VirtualDeviceNode> {
    * Physical Devices" above.
    */
   Device ToDevice() const {
-    ICHECK(device_type_int != kInvalidDeviceType);
-    ICHECK(virtual_device_id != -1);
+    TVM_FFI_ICHECK(device_type_int != kInvalidDeviceType);
+    TVM_FFI_ICHECK(virtual_device_id != -1);
     Device device;
     device.device_type = device_type();
     device.device_id = virtual_device_id;
@@ -288,7 +288,7 @@ class VirtualDevice : public ObjectRef {
    * The target and memory scope will be unconstrained.
    */
   static VirtualDevice ForDeviceType(DLDeviceType device_type, int virtual_device_id = -1) {
-    ICHECK_GT(device_type, 0);
+    TVM_FFI_ICHECK_GT(device_type, 0);
     return VirtualDevice(device_type, virtual_device_id);
   }
   static VirtualDevice ForDeviceType(int device_type, int virtual_device_id = -1) {
@@ -365,7 +365,7 @@ class VirtualDeviceCache {
 
  private:
   /*! \brief Already constructed VirtualDevices. */
-  std::unordered_set<VirtualDevice, StructuralHash, StructuralEqual> cache_;
+  std::unordered_set<VirtualDevice, ffi::StructuralHash, ffi::StructuralEqual> cache_;
 };
 
 /*! brief The attribute key for the virtual device. This key will be promoted to first class on

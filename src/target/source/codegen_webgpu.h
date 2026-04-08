@@ -73,12 +73,11 @@ class CodeGenWebGPU final : public CodeGenC {
   void VisitExpr_(const IntImmNode* op, std::ostream& os) final;      // NOLINT(*)
 
   // stmt printing
-  void VisitStmt_(const LetStmtNode* op) final;
+  void VisitStmt_(const BindNode* op) final;
   void VisitStmt_(const BufferStoreNode* op) final;
   void VisitStmt_(const ForNode* op) final;
-  void VisitStmt_(const AllocateNode* op) final;
+  void VisitStmt_(const AllocBufferNode* op) final;
   void VisitStmt_(const AssertStmtNode* op) final;
-  void VisitStmt_(const AllocateConstNode* op) final;
   void VisitStmt_(const WhileNode* op) final;
 
  private:
@@ -93,6 +92,8 @@ class CodeGenWebGPU final : public CodeGenC {
 
   // whether enable fp16
   bool enable_fp16_{false};
+  // whether enable subgroups
+  bool enable_subgroups_{false};
 
   /*! \brief the header stream for function label and enable directive if any, goes before any other
    * declaration */

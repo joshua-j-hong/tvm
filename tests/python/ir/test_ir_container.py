@@ -14,11 +14,12 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# ruff: noqa: E712, F401
+import numpy as np
 import pytest
 import tvm_ffi
+
 import tvm
-from tvm import te
-import numpy as np
 
 
 def test_array():
@@ -45,8 +46,8 @@ def test_dir_array():
 
 
 def test_map():
-    a = te.var("a")
-    b = te.var("b")
+    a = tvm.tirx.Var("a", "int32")
+    b = tvm.tirx.Var("b", "int32")
     amap = tvm.runtime.convert({a: 2, b: 3})
     assert a in amap
     assert len(amap) == 2
@@ -70,8 +71,8 @@ def test_str_map():
 
 
 def test_map_save_load_json():
-    a = te.var("a")
-    b = te.var("b")
+    a = tvm.tirx.Var("a", "int32")
+    b = tvm.tirx.Var("b", "int32")
     amap = tvm.runtime.convert({a: 2, b: 3})
     json_str = tvm.ir.save_json(amap)
     amap = tvm.ir.load_json(json_str)
@@ -81,15 +82,15 @@ def test_map_save_load_json():
 
 
 def test_dir_map():
-    a = te.var("a")
-    b = te.var("b")
+    a = tvm.tirx.Var("a", "int32")
+    b = tvm.tirx.Var("b", "int32")
     amap = tvm.runtime.convert({a: 2, b: 3})
     assert dir(amap)
 
 
 def test_getattr_map():
-    a = te.var("a")
-    b = te.var("b")
+    a = tvm.tirx.Var("a", "int32")
+    b = tvm.tirx.Var("b", "int32")
     amap = tvm.runtime.convert({a: 2, b: 3})
     assert isinstance(amap, tvm_ffi.Map)
 
@@ -111,7 +112,7 @@ def test_tensor_container():
 def test_return_variant_type():
     func = tvm.get_global_func("testing.ReturnsVariant")
     res_even = func(42)
-    assert isinstance(res_even, tvm.tir.IntImm)
+    assert isinstance(res_even, tvm.tirx.IntImm)
     assert res_even == 21
 
     res_odd = func(17)
@@ -127,7 +128,7 @@ def test_pass_variant_type():
 
 def test_pass_incorrect_variant_type():
     func = tvm.get_global_func("testing.AcceptsVariant")
-    float_arg = tvm.tir.FloatImm("float32", 0.5)
+    float_arg = tvm.tirx.FloatImm("float32", 0.5)
 
     with pytest.raises(Exception):
         func(float_arg)

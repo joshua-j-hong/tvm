@@ -51,7 +51,7 @@ namespace arith {
 // Forward declare Analyzer
 class Analyzer;
 
-using tir::Var;
+using tirx::Var;
 
 enum DivMode {
   /*! \brief Truncated division. */
@@ -537,10 +537,10 @@ class TransitiveComparisonAnalyzer {
  *  arith::Analyzer analyzer;
  *  {
  *    With<arith::ConstraintContext> scope(&analyzer, x % 3 == 0);
- *    ICHECK_EQ(analyzer.modular_set(x)->coeff, 3);
+ *    TVM_FFI_ICHECK_EQ(analyzer.modular_set(x)->coeff, 3);
  *  }
  *  // constraint no longer in effect.
- *  ICHECK_NE(analyzer.modular_set(x)->coeff, 3);
+ *  TVM_FFI_ICHECK_NE(analyzer.modular_set(x)->coeff, 3);
  *
  * \endcode
  */
@@ -563,7 +563,7 @@ class ConstraintContext {
   Analyzer* analyzer_;
   /*! \brief The constraint */
   PrimExpr constraint_;
-  /*! \brief function to be called in recovery */
+  /*! \brief functions to be called in recovery */
   std::vector<std::function<void()>> recovery_functions_;
 };
 
